@@ -1,0 +1,74 @@
+//@version=6
+indicator("AI Trading Platform V4 Scanner", overlay=true)
+
+emaFastLen = input.int(20, "Fast EMA")
+emaSlowLen = input.int(50, "Slow EMA")
+rsiLen     = input.int(14, "RSI Length")
+rsiMin     = input.float(55, "Minimum RSI")
+gapMin     = input.float(3.0, "Minimum Gap Up %")
+relVolMin  = input.float(2.0, "Minimum Relative Volume")
+atrLen     = input.int(14, "ATR Length")
+rrTarget   = input.float(2.0, "Reward/Risk Target")
+useVWAP    = input.bool(true, "Require Price Above VWAP")
+use4H      = input.bool(true, "Require 4H Bull Trend")
+use1H      = input.bool(true, "Require 1H Bull Trend")
+
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+rsiVal  = ta.rsi(close, rsiLen)
+atrVal  = ta.atr(atrLen)
+vwapVal = ta.vwap(close)
+avgVol  = ta.sma(volume, 20)
+relVol  = volume / avgVol
+
+prevDailyClose = request.security(syminfo.tickerid, "D", close[1])
+gapPct = ((close - prevDailyClose) / prevDailyClose) * 100
+
+ema20_4h = request.security(syminfo.tickerid, "240", ta.ema(close, 20))
+ema50_4h = request.security(syminfo.tickerid, "240", ta.ema(close, 50))
+trend4hBull = ema20_4h > ema50_4h
+
+ema20_1h = request.security(syminfo.tickerid, "60", ta.ema(close, 20))
+ema50_1h = request.security(syminfo.tickerid, "60", ta.ema(close, 50))
+trend1hBull = ema20_1h > ema50_1h
+
+priceAboveEMA = close > emaFast
+emaBullish    = emaFast > emaSlow
+rsiBullish    = rsiVal > rsiMin
+gapStrong     = gapPct >= gapMin
+volumeStrong  = relVol >= relVolMin
+vwapOK        = useVWAP ? close > vwapVal : true
+trend4hOK     = use4H ? trend4hBull : true
+trend1hOK     = use1H ? trend1hBull : true
+
+aiLongSignal = priceAboveEMA and emaBullish and rsiBullish and gapStrong and volumeStrong and vwapOK and trend4hOK and trend1hOK
+
+stopLoss = close - atrVal
+takeProfit = close + (atrVal * rrTarget)
+
+plot(emaFast, "EMA 20")
+plot(emaSlow, "EMA 50")
+plot(vwapVal, "VWAP")
+plotshape(aiLongSignal, title="AI LONG", style=shape.labelup, text="AI LONG", location=location.belowbar)
+
+alertMessage =
+     '{"symbol":"' + syminfo.ticker + '"' +
+     ',"timeframe":"' + timeframe.period + '"' +
+     ',"signal":"LONG"' +
+     ',"price":' + str.tostring(close) +
+     ',"gap_pct":' + str.tostring(gapPct) +
+     ',"relative_volume":' + str.tostring(relVol) +
+     ',"rsi":' + str.tostring(rsiVal) +
+     ',"ema20":' + str.tostring(emaFast) +
+     ',"ema50":' + str.tostring(emaSlow) +
+     ',"vwap":' + str.tostring(vwapVal) +
+     ',"trend_4h":"' + (trend4hBull ? "BULLISH" : "BEARISH") + '"' +
+     ',"trend_1h":"' + (trend1hBull ? "BULLISH" : "BEARISH") + '"' +
+     ',"orb_breakout":"N/A"' +
+     ',"atr":' + str.tostring(atrVal) +
+     ',"stop_loss":' + str.tostring(stopLoss) +
+     ',"take_profit":' + str.tostring(takeProfit) +
+     '}'
+
+if aiLongSignal and barstate.isconfirmed
+    alert(alertMessage, alert.freq_once_per_bar_close)
