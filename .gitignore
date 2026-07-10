@@ -1,0 +1,29 @@
+# Virtual environments
+.venv/
+venv/
+
+# Secrets
+config/config.env
+.env
+*.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime data
+logs/
+*.log
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# Editor and Windows
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
