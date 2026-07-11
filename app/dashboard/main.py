@@ -3,6 +3,7 @@ import time
 import pandas as pd
 import streamlit as st
 
+from app.dashboard.components.approval_queue import show_approval_queue
 from app.broker.ibkr_official import get_account_summary, get_positions
 from app.db.database import get_signals
 
@@ -355,7 +356,8 @@ else:
 
 
 st.divider()
-
+show_approval_queue()
+st.divider()
 
 st.subheader("Portfolio Manager")
 
