@@ -6,6 +6,7 @@ AI Trading Platform V5.1
 import pandas as pd
 import streamlit as st
 
+from app.ai.trade_manager import analyze_trade
 from app.ai.position_health import score_position
 from app.db.database import get_latest_signal_for_symbol
 
@@ -54,9 +55,44 @@ def show_live_positions(positions_data: dict) -> None:
         latest_ai_decisions = []
         latest_ai_risks = []
         health_scores = []
-        health_statuses = []
-        recommendations = []
-        health_reasons = []
+        trade_recommendations = []
+        trade_confidences = []
+        suggested_stops = []
+        suggested_targets = []
+        trade_reasons = []
+
+    for _, row in df.iterrows():
+        if pd.isna(row["currentPrice"]) or float(row["avgCost"]) <= 0:
+            trade_recommendations.append("WATCH")
+            trade_confidences.append(0)
+            suggested_stops.append(None)
+            suggested_targets.append(None)
+            trade_reasons.append("Current price or average cost is unavailable.")
+            continue
+
+    analysis = analyze_trade(
+        entry_price=float(row["avgCost"]),
+        current_price=float(row["currentPrice"]),
+        health_score=int(row["healthScore"]),
+        ai_decision=str(row["latestAiDecision"] or ""),
+        ai_risk=str(row["latestAiRisk"] or ""),
+    )
+
+    trade_recommendations.append(analysis["recommendation"])
+    trade_confidences.append(analysis["confidence"])
+    suggested_stops.append(analysis["stop_loss"])
+    suggested_targets.append(analysis["take_profit"])
+    trade_reasons.append("; ".join(analysis["reasons"]))
+
+    df["tradeRecommendation"] = trade_recommendations
+    df["tradeConfidence"] = trade_confidences
+    df["suggestedStop"] = suggested_stops
+    df["suggestedTarget"] = suggested_targets
+    df["tradeReasons"] = trade_reasons
+    
+    health_statuses = []
+    recommendations = []
+    health_reasons = []
     
     if latest_signal:
         latest_ai_score = latest_signal.get("ai_score")
