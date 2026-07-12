@@ -3,6 +3,7 @@ import time
 import pandas as pd
 import streamlit as st
 
+from app.dashboard.components.market_scanner import show_market_scanner
 from app.dashboard.components.live_positions import show_live_positions
 from app.dashboard.components.portfolio_summary import show_portfolio_summary
 from app.dashboard.components.open_orders import show_open_orders
@@ -374,6 +375,8 @@ show_live_positions(positions_data)
 st.divider()
 st.subheader("System Status")
 
+st.divider()
+show_market_scanner()
 
 st.divider()
 
