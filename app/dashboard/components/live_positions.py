@@ -6,6 +6,7 @@ AI Trading Platform V5.1
 import pandas as pd
 import streamlit as st
 
+from app.ai.position_health import score_position
 from app.db.database import get_latest_signal_for_symbol
 
 
@@ -48,6 +49,36 @@ def show_live_positions(positions_data: dict) -> None:
 
     for symbol in df["symbol"]:
         latest_signal = get_latest_signal_for_symbol(str(symbol))
+
+        latest_ai_scores = []
+        latest_ai_decisions = []
+        latest_ai_risks = []
+        health_scores = []
+        health_statuses = []
+        recommendations = []
+        health_reasons = []
+    
+    if latest_signal:
+        latest_ai_score = latest_signal.get("ai_score")
+        latest_ai_decision = latest_signal.get("ai_decision")
+        latest_ai_risk = latest_signal.get("ai_risk")
+
+        "latestAiScore",
+        "latestAiDecision",
+        "latestAiRisk",
+        "healthScore",
+        "healthStatus",
+        "recommendation",
+        "healthReasons",
+    
+    else:
+        latest_ai_score = None
+        latest_ai_decision = None
+        latest_ai_risk = None
+
+        latest_ai_scores.append(latest_ai_score)
+        latest_ai_decisions.append(latest_ai_decision)
+        latest_ai_risks.append(latest_ai_risk)
 
         if latest_signal and latest_signal.get("price") is not None:
             latest_prices.append(float(latest_signal["price"]))

@@ -371,94 +371,11 @@ show_portfolio_summary(account_data)
 st.divider()
 show_live_positions(positions_data)
 
-
-
-positions = positions_data.get("positions", [])
-
-if positions:
-    df_positions = pd.DataFrame(positions)
-
-    df_positions["position"] = pd.to_numeric(
-        df_positions["position"],
-        errors="coerce",
-    ).fillna(0)
-
-    df_positions["avgCost"] = pd.to_numeric(
-        df_positions["avgCost"],
-        errors="coerce",
-    ).fillna(0)
-
-    df_positions["costBasis"] = (
-        df_positions["position"]
-        * df_positions["avgCost"]
-    )
-
-    total_positions = len(df_positions)
-    total_shares = float(
-        df_positions["position"].sum()
-    )
-
-    total_cost_basis = float(
-        df_positions["costBasis"].sum()
-    )
-
-    c1, c2, c3 = st.columns(3)
-
-    c1.metric(
-        "Open Positions",
-        total_positions,
-    )
-
-    c2.metric(
-        "Total Shares",
-        f"{total_shares:,.0f}",
-    )
-
-    c3.metric(
-        "Total Cost Basis",
-        format_money(total_cost_basis),
-    )
-
-    portfolio_columns = [
-        "account",
-        "symbol",
-        "secType",
-        "currency",
-        "exchange",
-        "position",
-        "avgCost",
-        "costBasis",
-    ]
-
-    available_portfolio_columns = [
-        column
-        for column in portfolio_columns
-        if column in df_positions.columns
-    ]
-
-    st.dataframe(
-        df_positions[available_portfolio_columns],
-        width="stretch",
-        hide_index=True,
-    )
-
-else:
-    positions_error = positions_data.get("error")
-
-    if positions_error:
-        st.warning(
-            f"Position reader unavailable: {positions_error}"
-        )
-    else:
-        st.info(
-            "No open positions found in the IBKR paper account."
-        )
+st.divider()
+st.subheader("System Status")
 
 
 st.divider()
-
-
-
 
 status_col1, status_col2, status_col3 = st.columns(3)
 
