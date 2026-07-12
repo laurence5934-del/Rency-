@@ -1,14 +1,16 @@
 """
-Live Position Manager
-AI Trading Platform V5.0
+Live Position Analytics
+AI Trading Platform V5.1
 """
 
 import pandas as pd
 import streamlit as st
 
+from app.db.database import get_latest_signal_for_symbol
+
 
 def show_live_positions(positions_data: dict) -> None:
-    st.subheader("Live Position Manager")
+    st.subheader("Live Position Analytics")
 
     positions = positions_data.get("positions", [])
 
@@ -41,34 +43,98 @@ def show_live_positions(positions_data: dict) -> None:
         errors="coerce",
     ).fillna(0)
 
+    latest_prices = []
+    price_sources = []
+
+    for symbol in df["symbol"]:
+        latest_signal = get_latest_signal_for_symbol(str(symbol))
+
+        if latest_signal and latest_signal.get("price") is not None:
+            latest_prices.append(float(latest_signal["price"]))
+            price_sources.append("TradingView signal")
+        else:
+            latest_prices.append(None)
+            price_sources.append("Unavailable")
+
+    df["currentPrice"] = latest_prices
+    df["priceSource"] = price_sources
+
     df["costBasis"] = (
         df["position"].abs()
         * df["avgCost"]
     )
 
-    total_positions = len(df)
-    total_shares = df["position"].abs().sum()
-    total_cost_basis = df["costBasis"].sum()
+    df["marketValue"] = (
+        df["position"]
+        * df["currentPrice"]
+    )
 
-    long_positions = int((df["position"] > 0).sum())
-    short_positions = int((df["position"] < 0).sum())
+    df["unrealizedPnL"] = (
+        df["marketValue"]
+        - (df["position"] * df["avgCost"])
+    )
+
+    df["pnlPct"] = 0.0
+
+    valid_cost = df["avgCost"] != 0
+
+    df.loc[valid_cost, "pnlPct"] = (
+        (
+            df.loc[valid_cost, "currentPrice"]
+            - df.loc[valid_cost, "avgCost"]
+        )
+        / df.loc[valid_cost, "avgCost"]
+        * 100
+    )
+
+    def position_status(pnl_value) -> str:
+        if pd.isna(pnl_value):
+            return "NO PRICE"
+        if pnl_value > 0:
+            return "WINNING"
+        if pnl_value < 0:
+            return "LOSING"
+        return "BREAK EVEN"
+
+    df["status"] = df["unrealizedPnL"].apply(position_status)
+
+    total_positions = len(df)
+    total_market_value = pd.to_numeric(
+        df["marketValue"],
+        errors="coerce",
+    ).fillna(0).sum()
+
+    total_unrealized_pnl = pd.to_numeric(
+        df["unrealizedPnL"],
+        errors="coerce",
+    ).fillna(0).sum()
+
+    winning_positions = int(
+        (df["status"] == "WINNING").sum()
+    )
+
+    losing_positions = int(
+        (df["status"] == "LOSING").sum()
+    )
 
     c1, c2, c3, c4, c5 = st.columns(5)
 
     c1.metric("Open Positions", total_positions)
-    c2.metric("Total Shares", f"{total_shares:,.0f}")
-    c3.metric("Long Positions", long_positions)
-    c4.metric("Short Positions", short_positions)
-    c5.metric("Total Cost Basis", f"${total_cost_basis:,.2f}")
+    c2.metric("Market Value", f"${total_market_value:,.2f}")
+    c3.metric("Unrealized P/L", f"${total_unrealized_pnl:,.2f}")
+    c4.metric("Winning", winning_positions)
+    c5.metric("Losing", losing_positions)
 
     display_columns = [
-        "account",
         "symbol",
-        "secType",
-        "currency",
         "position",
         "avgCost",
-        "costBasis",
+        "currentPrice",
+        "marketValue",
+        "unrealizedPnL",
+        "pnlPct",
+        "status",
+        "priceSource",
     ]
 
     st.dataframe(
@@ -78,7 +144,7 @@ def show_live_positions(positions_data: dict) -> None:
     )
 
     st.caption(
-        "Live market value and unrealized P/L will be added after "
-        "IBKR market-data access or TradingView price synchronization "
-        "is available."
+        "Current prices are taken from the latest stored TradingView "
+        "signal for each symbol. These prices may be stale and are not "
+        "a substitute for live broker market data."
     )

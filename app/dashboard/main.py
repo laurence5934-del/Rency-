@@ -371,7 +371,7 @@ show_portfolio_summary(account_data)
 st.divider()
 show_live_positions(positions_data)
 
-st.subheader("Portfolio Manager")
+
 
 positions = positions_data.get("positions", [])
 
@@ -458,7 +458,7 @@ else:
 st.divider()
 
 
-st.subheader("System Status")
+
 
 status_col1, status_col2, status_col3 = st.columns(3)
 

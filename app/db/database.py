@@ -66,3 +66,23 @@ def get_signals(limit: int = 500):
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM signals ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
+    
+    
+def get_latest_signal_for_symbol(symbol: str) -> dict | None:
+    init_db()
+
+    with get_conn() as conn:
+        conn.row_factory = sqlite3.Row
+
+        row = conn.execute(
+            """
+            SELECT *
+            FROM signals
+            WHERE UPPER(symbol) = UPPER(?)
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (symbol,),
+        ).fetchone()
+
+    return dict(row) if row else None
