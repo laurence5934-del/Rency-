@@ -3,6 +3,7 @@ import time
 import pandas as pd
 import streamlit as st
 
+from app.dashboard.components.live_positions import show_live_positions
 from app.dashboard.components.portfolio_summary import show_portfolio_summary
 from app.dashboard.components.open_orders import show_open_orders
 from app.dashboard.components.approval_queue import show_approval_queue
@@ -363,10 +364,12 @@ st.divider()
 
 st.divider()
 show_open_orders()
-st.divider()
 
-show_portfolio_summary(account_data)
 st.divider()
+show_portfolio_summary(account_data)
+
+st.divider()
+show_live_positions(positions_data)
 
 st.subheader("Portfolio Manager")
 
