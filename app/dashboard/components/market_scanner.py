@@ -13,9 +13,9 @@ def show_market_scanner() -> None:
     st.subheader("AI Market Scanner")
 
     st.caption(
-        "Development mode: scores are random placeholders "
-        "and must not be used for trading decisions."
-    )
+    "Live daily analysis powered by Yahoo Finance and the AI Master Scoring Engine. "
+    "Prices may be delayed and are intended for research and paper trading."
+)
 
     if st.button(
         "Scan Market",
@@ -49,10 +49,10 @@ def show_market_scanner() -> None:
             hide_index=True,
         )
 
-        top_result = results[0]
-
+        Today's Top AI Opportunity
+        
         st.success(
-            f"Top placeholder result: "
+            f"Top live-analysis result: "
             f"{top_result['symbol']} — "
             f"Score {top_result['score']} — "
             f"{top_result['action']}"

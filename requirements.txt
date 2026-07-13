@@ -7,3 +7,4 @@ python-dotenv
 openai
 requests
 ibapi
+yfinance
