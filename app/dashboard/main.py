@@ -3,9 +3,11 @@ import time
 import pandas as pd
 import streamlit as st
 
+from app.dashboard.components.trade_candidate import show_trade_candidate
 from app.dashboard.components.market_scanner import show_market_scanner
 from app.dashboard.components.live_positions import show_live_positions
 from app.dashboard.components.portfolio_summary import show_portfolio_summary
+from app.dashboard.components.opportunity_card import(show_opportunity_card,)
 from app.dashboard.components.open_orders import show_open_orders
 from app.dashboard.components.approval_queue import show_approval_queue
 from app.broker.ibkr_official import get_account_summary, get_positions
@@ -377,6 +379,7 @@ st.subheader("System Status")
 
 st.divider()
 show_market_scanner()
+
 
 st.divider()
 
