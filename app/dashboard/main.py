@@ -3,6 +3,9 @@ import time
 import pandas as pd
 import streamlit as st
 
+from app.dashboard.controllers.dashboard_controller import (
+    initialize_dashboard_state,
+)
 from app.dashboard.components.trade_candidate import show_trade_candidate
 from app.dashboard.components.market_scanner import show_market_scanner
 from app.dashboard.components.live_positions import show_live_positions
@@ -19,6 +22,8 @@ st.set_page_config(
     page_icon="📈",
     layout="wide",
 )
+
+initialize_dashboard_state()
 
 st.title("AI Trading Platform V4 Professional")
 st.caption(

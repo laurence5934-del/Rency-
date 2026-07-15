@@ -1,93 +1,58 @@
 """
 AI Trade Candidate Review Card
-AI Trading Platform Version 7.1
+AI Trading Platform Version 7.2
 
-This component is review-only.
-It does not submit, modify, or cancel IBKR orders.
+Review-only dashboard component.
+Approved candidates can later be persisted to SQLite.
+This file does not submit IBKR orders.
 """
 
 from typing import Any
 
 import streamlit as st
-
+from app.db.approval_queue import add_candidate
+from app.dashboard.controllers.dashboard_controller import (
+    get_candidate_queue_id,
+    get_candidate_review_status,
+    set_candidate_review_status,
+)
 
 def show_trade_candidate(
     candidate: dict[str, Any],
 ) -> str | None:
-    """
-    Display a trade candidate and return its current review status.
-
-    Possible statuses:
-    - APPROVED_FOR_REVIEW
-    - REJECTED
-    - None
-    """
-
     if not candidate:
         st.info("No trade candidate is available.")
         return None
 
-    symbol = str(
-        candidate.get("symbol", "N/A")
-    ).upper()
-
-    score = int(
-        candidate.get("score", 0) or 0
-    )
-
-    action = str(
-        candidate.get("action", "N/A")
-    ).upper()
-
-    quantity = int(
-        candidate.get("quantity", 0) or 0
-    )
+    symbol = str(candidate.get("symbol", "N/A")).upper()
+    score = int(candidate.get("score", 0) or 0)
+    action = str(candidate.get("action", "N/A")).upper()
+    quantity = int(candidate.get("quantity", 0) or 0)
 
     entry_price = float(
         candidate.get("entry_price", 0) or 0
     )
-
     stop_loss = float(
         candidate.get("stop_loss", 0) or 0
     )
-
     target_price = float(
         candidate.get("target_price", 0) or 0
     )
-
     risk_budget = float(
         candidate.get("risk_budget", 0) or 0
     )
-
     estimated_risk = float(
-        candidate.get(
-            "estimated_dollar_risk",
-            0,
-        )
-        or 0
+        candidate.get("estimated_dollar_risk", 0) or 0
     )
-
     estimated_reward = float(
-        candidate.get(
-            "estimated_reward",
-            0,
-        )
-        or 0
+        candidate.get("estimated_reward", 0) or 0
     )
-
     risk_reward_ratio = float(
-        candidate.get(
-            "risk_reward_ratio",
-            0,
-        )
-        or 0
+        candidate.get("risk_reward_ratio", 0) or 0
     )
 
     eligible = bool(
-        candidate.get(
-            "approval_eligible",
-            False,
-        )
+        candidate.get("approval_eligible", False)
     )
 
     reasons = candidate.get("reasons", [])
@@ -98,69 +63,29 @@ def show_trade_candidate(
     if status_key not in st.session_state:
         st.session_state[status_key] = None
 
-    st.subheader(
-        f"AI Trade Candidate - {symbol}"
-    )
+    st.subheader(f"AI Trade Candidate - {symbol}")
 
     c1, c2, c3, c4 = st.columns(4)
 
-    c1.metric(
-        "AI Score",
-        f"{score}/100",
-    )
-
-    c2.metric(
-        "Action",
-        action,
-    )
-
-    c3.metric(
-        "Quantity",
-        f"{quantity:,}",
-    )
-
-    c4.metric(
-        "Eligible",
-        "YES" if eligible else "NO",
-    )
+    c1.metric("AI Score", f"{score}/100")
+    c2.metric("Action", action)
+    c3.metric("Quantity", f"{quantity:,}")
+    c4.metric("Eligible", "YES" if eligible else "NO")
 
     st.divider()
     st.markdown("### Trade Plan")
 
     p1, p2, p3 = st.columns(3)
 
-    p1.metric(
-        "Entry",
-        f"${entry_price:,.2f}",
-    )
-
-    p2.metric(
-        "Stop Loss",
-        f"${stop_loss:,.2f}",
-    )
-
-    p3.metric(
-        "Target",
-        f"${target_price:,.2f}",
-    )
+    p1.metric("Entry", f"${entry_price:,.2f}")
+    p2.metric("Stop Loss", f"${stop_loss:,.2f}")
+    p3.metric("Target", f"${target_price:,.2f}")
 
     r1, r2, r3, r4 = st.columns(4)
 
-    r1.metric(
-        "Risk Budget",
-        f"${risk_budget:,.2f}",
-    )
-
-    r2.metric(
-        "Estimated Risk",
-        f"${estimated_risk:,.2f}",
-    )
-
-    r3.metric(
-        "Estimated Reward",
-        f"${estimated_reward:,.2f}",
-    )
-
+    r1.metric("Risk Budget", f"${risk_budget:,.2f}")
+    r2.metric("Estimated Risk", f"${estimated_risk:,.2f}")
+    r3.metric("Estimated Reward", f"${estimated_reward:,.2f}")
     r4.metric(
         "Risk / Reward",
         f"{risk_reward_ratio:.2f}:1",
@@ -177,6 +102,13 @@ def show_trade_candidate(
 
         for warning in warnings:
             st.warning(str(warning))
+
+    if not eligible:
+        st.warning(
+            "Approval is disabled because this candidate did not "
+            "pass the minimum BUY action, AI score, position-size, "
+            "and risk/reward requirements."
+        )
 
     confirmation = st.checkbox(
         (
@@ -208,23 +140,47 @@ def show_trade_candidate(
         )
 
     if approve_clicked:
-        st.session_state[
-            status_key
-        ] = "APPROVED_FOR_REVIEW"
+        try:
+            queue_id = add_candidate(candidate)
+
+            set_candidate_review_status(
+                "SAVED_TO_QUEUE",
+                queue_id=queue_id,
+            )
+
+        except ValueError as exc:
+            set_candidate_review_status("QUEUE_BLOCKED")
+            st.error(str(exc))
+
+        except Exception as exc:
+            set_candidate_review_status("QUEUE_ERROR")
+            st.error(
+                f"Could not save the candidate to the approval queue: {exc}"
+            )
 
     if reject_clicked:
-        st.session_state[
-            status_key
-        ] = "REJECTED"
+        set_candidate_review_status("REJECTED")
 
-    current_status = st.session_state[
-        status_key
-    ]
+    current_status = get_candidate_review_status()
 
-    if current_status == "APPROVED_FOR_REVIEW":
+    if current_status == "SAVED_TO_QUEUE":
+        queue_id = get_candidate_queue_id()
+
         st.success(
-            "Candidate approved for paper-trade review. "
+            f"Candidate saved to the persistent approval queue. "
+            f"Queue ID: {queue_id}. "
             "No broker order has been submitted."
+        )
+
+    elif current_status == "QUEUE_BLOCKED":
+        st.warning(
+            "This candidate was not added because a pending or active "
+            "candidate already exists for the symbol."
+        )
+
+    elif current_status == "QUEUE_ERROR":
+        st.error(
+            "The candidate could not be saved to the approval queue."
         )
 
     elif current_status == "REJECTED":
@@ -234,10 +190,8 @@ def show_trade_candidate(
         )
 
     st.caption(
-        "This component records only a temporary dashboard "
-        "decision. IBKR execution will be added separately "
-        "after database persistence and duplicate-order "
-        "protection are implemented."
+        "Approved candidates are stored persistently in SQLite. "
+        "No IBKR order is submitted from this card."
     )
 
     return current_status
