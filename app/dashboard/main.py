@@ -8,6 +8,9 @@ from app.dashboard.controllers.dashboard_controller import (
 )
 from app.dashboard.components.trade_candidate import show_trade_candidate
 from app.dashboard.components.market_scanner import show_market_scanner
+from app.dashboard.components.approval_queue_dashboard import (
+    show_approval_queue_dashboard,
+)
 from app.dashboard.components.live_positions import show_live_positions
 from app.dashboard.components.portfolio_summary import show_portfolio_summary
 from app.dashboard.components.opportunity_card import(show_opportunity_card,)
@@ -380,11 +383,13 @@ st.divider()
 show_live_positions(positions_data)
 
 st.divider()
-st.subheader("System Status")
-
-st.divider()
 show_market_scanner()
 
+st.divider()
+show_approval_queue_dashboard()
+
+st.divider()
+st.subheader("System Status")
 
 st.divider()
 

@@ -6,6 +6,12 @@ AI Trading Platform Version 7.2
 import pandas as pd
 import streamlit as st
 
+from app.ai.trading_assistant import (
+    build_trading_assistant_summary,
+)
+from app.dashboard.components.trading_assistant import (
+    show_trading_assistant,
+)
 from app.ai.trade_candidate import build_trade_candidate
 from app.dashboard.components.opportunity_card import (
     show_opportunity_card,
@@ -171,3 +177,11 @@ def show_market_scanner() -> None:
 
     st.divider()
     show_trade_candidate(candidate)
+
+    assistant_result = build_trading_assistant_summary(
+        opportunity=top_result,
+        candidate=candidate,
+    )
+
+    st.divider()
+    show_trading_assistant(assistant_result)
