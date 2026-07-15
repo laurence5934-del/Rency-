@@ -9,6 +9,10 @@ This component does not submit IBKR orders.
 import pandas as pd
 import streamlit as st
 
+from app.dashboard.components.paper_execution_console import (
+    show_paper_execution_console,
+)
+
 from app.db.approval_queue import (
     get_pending_candidates,
     update_status,
@@ -90,6 +94,7 @@ def show_approval_queue_dashboard() -> None:
     candidate_id = int(selected_candidate["id"])
     symbol = str(selected_candidate["symbol"]).upper()
 
+
     st.markdown("### Selected Candidate")
 
     d1, d2, d3, d4 = st.columns(4)
@@ -112,7 +117,12 @@ def show_approval_queue_dashboard() -> None:
             "Created": selected_candidate["created_at"],
         }
     )
+    st.divider()
 
+    show_paper_execution_console(
+        selected_candidate,
+        ibkr_connected=True,
+    )
     confirm_reject = st.checkbox(
         f"I confirm rejection of queue candidate #{candidate_id}.",
         key=f"queue_reject_confirm_{candidate_id}",

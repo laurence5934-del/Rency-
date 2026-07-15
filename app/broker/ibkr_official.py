@@ -105,6 +105,57 @@ def make_limit_order(action: str, quantity: int, limit_price: float) -> Order:
     order.firmQuoteOnly = False
     return order
 
+def make_api_order(
+    *,
+    action: str,
+    quantity: int,
+    order_type: str,
+    limit_price: float | None = None,
+    transmit: bool = True,
+) -> Order:
+    """
+    Build an IBKR market or limit order.
+
+    transmit=True submits the order to the connected account.
+    Use only while connected to the IBKR paper account.
+    """
+
+    normalized_action = str(action or "").strip().upper()
+    normalized_order_type = str(order_type or "").strip().upper()
+
+    if normalized_action not in {"BUY", "SELL"}:
+        raise ValueError(
+            "Order action must be BUY or SELL."
+        )
+
+    if quantity <= 0:
+        raise ValueError(
+            "Order quantity must be greater than zero."
+        )
+
+    if normalized_order_type not in {"MKT", "LMT"}:
+        raise ValueError(
+            "Order type must be MKT or LMT."
+        )
+
+    order = Order()
+    order.action = normalized_action
+    order.orderType = normalized_order_type
+    order.totalQuantity = int(quantity)
+    order.tif = "DAY"
+    order.transmit = bool(transmit)
+    order.eTradeOnly = False
+    order.firmQuoteOnly = False
+
+    if normalized_order_type == "LMT":
+        if limit_price is None or float(limit_price) <= 0:
+            raise ValueError(
+                "A positive limit price is required for LMT orders."
+            )
+
+        order.lmtPrice = float(limit_price)
+
+    return order
 
 def connect_ibkr(timeout: int = 10) -> IBKRApp:
     app = IBKRApp()
@@ -246,7 +297,173 @@ def place_paper_buy(symbol: str, quantity: int) -> dict:
     finally:
         app.disconnect()
 
+def submit_prepared_paper_order(
+    order_request: dict,
+    *,
+    paper_account_confirmed: bool,
+    wait_seconds: float = 5.0,
+) -> dict:
+    """
+    Submit a previously validated order package to IBKR paper trading.
 
+    This function requires:
+    - PAPER_TRADING_ONLY enabled
+    - explicit paper-account confirmation
+    - order_request["paper_only"] == True
+    - order_request["transmit"] == False from the preview layer
+
+    The IBKR Order itself is created with transmit=True so that it is
+    actually submitted to the connected paper account.
+    """
+
+    if not PAPER_TRADING_ONLY:
+        return {
+            "submitted": False,
+            "status": "LIVE_TRADING_BLOCKED",
+            "message": (
+                "PAPER_TRADING_ONLY is disabled. "
+                "Submission was blocked."
+            ),
+        }
+
+    if not paper_account_confirmed:
+        return {
+            "submitted": False,
+            "status": "PAPER_CONFIRMATION_REQUIRED",
+        }
+
+    if not bool(order_request.get("paper_only", False)):
+        return {
+            "submitted": False,
+            "status": "NON_PAPER_ORDER_BLOCKED",
+        }
+
+    # The preview package must remain non-transmitting.
+    if bool(order_request.get("transmit", True)):
+        return {
+            "submitted": False,
+            "status": "UNSAFE_PREVIEW_PACKAGE",
+            "message": (
+                "Expected a non-transmitting preview package."
+            ),
+        }
+
+    symbol = str(
+        order_request.get("symbol", "")
+    ).strip().upper()
+
+    action = str(
+        order_request.get("action", "")
+    ).strip().upper()
+
+    quantity = int(
+        order_request.get("quantity", 0) or 0
+    )
+
+    order_type = str(
+        order_request.get("order_type", "")
+    ).strip().upper()
+
+    limit_price = order_request.get("limit_price")
+
+    if not symbol:
+        raise ValueError("Order symbol cannot be empty.")
+
+    app = connect_ibkr()
+
+    try:
+        order_id = int(app.next_order_id)
+
+        contract = make_stock_contract(symbol)
+
+        order = make_api_order(
+            action=action,
+            quantity=quantity,
+            order_type=order_type,
+            limit_price=limit_price,
+            transmit=True,
+        )
+
+        app.placeOrder(
+            order_id,
+            contract,
+            order,
+        )
+
+        deadline = time.time() + max(
+            float(wait_seconds),
+            1.0,
+        )
+
+        while time.time() < deadline:
+            matching_statuses = [
+                status
+                for status in app.order_statuses
+                if int(status.get("orderId", -1)) == order_id
+            ]
+
+            if matching_statuses:
+                latest = matching_statuses[-1]
+                status_name = str(
+                    latest.get("status", "")
+                ).upper()
+
+                if status_name in {
+                    "PRESUBMITTED",
+                    "SUBMITTED",
+                    "FILLED",
+                    "CANCELLED",
+                    "INACTIVE",
+                    "APICANCELLED",
+                }:
+                    break
+
+            time.sleep(0.1)
+
+        matching_statuses = [
+            status
+            for status in app.order_statuses
+            if int(status.get("orderId", -1)) == order_id
+        ]
+
+        latest_status = (
+            matching_statuses[-1]["status"]
+            if matching_statuses
+            else "AWAITING_STATUS"
+        )
+
+        submitted = latest_status.upper() not in {
+            "CANCELLED",
+            "INACTIVE",
+            "APICANCELLED",
+        }
+
+        return {
+            "submitted": submitted,
+            "status": latest_status,
+            "order_id": order_id,
+            "symbol": symbol,
+            "action": action,
+            "quantity": quantity,
+            "order_type": order_type,
+            "limit_price": limit_price,
+            "account_candidates": app.accounts,
+            "statuses": matching_statuses,
+            "fills": app.fills,
+            "errors": app.errors[-10:],
+        }
+
+    except Exception as exc:
+        return {
+            "submitted": False,
+            "status": "ERROR",
+            "message": str(exc),
+            "errors": app.errors[-10:],
+        }
+
+    finally:
+        app.disconnect()
+        
 def cancel_order(order_id: int) -> dict:
     app = connect_ibkr()
 
