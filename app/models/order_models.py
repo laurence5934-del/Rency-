@@ -1,153 +1,118 @@
-import pytest
+"""
+Order Management System Models
+AI Trading Platform Version 7.7
 
-from app.broker.order_state_machine import (
-    can_transition,
-    next_state_from_ibkr,
-    normalize_ibkr_status,
-    require_transition,
-)
-from app.models.order_models import (
-    ManagedOrder,
-    OrderState,
-)
+Defines normalized OMS order states and persistent order records.
+"""
 
+from __future__ import annotations
 
-def test_created_order_can_be_validated():
-    assert can_transition(
-        OrderState.CREATED,
-        OrderState.VALIDATED,
-    )
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from enum import StrEnum
+from typing import Any
 
 
-def test_validated_order_can_be_approved():
-    assert can_transition(
-        OrderState.VALIDATED,
-        OrderState.APPROVED,
-    )
+class OrderState(StrEnum):
+    CREATED = "CREATED"
+    VALIDATED = "VALIDATED"
+    APPROVED = "APPROVED"
+    SUBMITTING = "SUBMITTING"
+    PRESUBMITTED = "PRESUBMITTED"
+    SUBMITTED = "SUBMITTED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+    CANCEL_PENDING = "CANCEL_PENDING"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+    INACTIVE = "INACTIVE"
+    ERROR = "ERROR"
 
 
-def test_approved_order_can_begin_submission():
-    assert can_transition(
-        OrderState.APPROVED,
-        OrderState.SUBMITTING,
-    )
+TERMINAL_ORDER_STATES = {
+    OrderState.FILLED,
+    OrderState.CANCELLED,
+    OrderState.REJECTED,
+    OrderState.INACTIVE,
+    OrderState.ERROR,
+}
 
 
-def test_submitted_order_can_be_partially_filled():
-    assert can_transition(
-        OrderState.SUBMITTED,
-        OrderState.PARTIALLY_FILLED,
-    )
+ACTIVE_ORDER_STATES = {
+    OrderState.CREATED,
+    OrderState.VALIDATED,
+    OrderState.APPROVED,
+    OrderState.SUBMITTING,
+    OrderState.PRESUBMITTED,
+    OrderState.SUBMITTED,
+    OrderState.PARTIALLY_FILLED,
+    OrderState.CANCEL_PENDING,
+}
 
 
-def test_terminal_order_cannot_return_to_active_state():
-    assert not can_transition(
-        OrderState.FILLED,
-        OrderState.SUBMITTED,
-    )
+@dataclass(frozen=True)
+class ManagedOrder:
+    local_order_id: int | None
+    broker_order_id: int | None
+    candidate_id: int | None
+    symbol: str
+    action: str
+    quantity: float
+    order_type: str
+    limit_price: float | None
+    state: OrderState
+    filled_quantity: float = 0.0
+    remaining_quantity: float = 0.0
+    average_fill_price: float = 0.0
+    last_fill_price: float = 0.0
+    strategy: str | None = None
+    paper_only: bool = True
+    created_at: str | None = None
+    updated_at: str | None = None
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.state in TERMINAL_ORDER_STATES
+
+    @property
+    def is_active(self) -> bool:
+        return self.state in ACTIVE_ORDER_STATES
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["state"] = self.state.value
+        data["is_terminal"] = self.is_terminal
+        data["is_active"] = self.is_active
+        return data
 
 
-def test_invalid_transition_raises_error():
-    with pytest.raises(
-        ValueError,
-        match="Invalid order-state transition",
-    ):
-        require_transition(
-            OrderState.CREATED,
-            OrderState.FILLED,
-        )
+@dataclass(frozen=True)
+class OrderEvent:
+    event_id: int | None
+    local_order_id: int
+    previous_state: OrderState | None
+    new_state: OrderState
+    source: str
+    message: str | None = None
+    broker_payload: dict[str, Any] | None = None
+    created_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "local_order_id": self.local_order_id,
+            "previous_state": (
+                self.previous_state.value
+                if self.previous_state
+                else None
+            ),
+            "new_state": self.new_state.value,
+            "source": self.source,
+            "message": self.message,
+            "broker_payload": self.broker_payload,
+            "created_at": self.created_at,
+        }
 
 
-def test_normalizes_ibkr_submitted_status():
-    state = normalize_ibkr_status(
-        "Submitted",
-        filled=0,
-        remaining=10,
-    )
-
-    assert state == OrderState.SUBMITTED
-
-
-def test_detects_partial_fill_from_quantities():
-    state = normalize_ibkr_status(
-        "Submitted",
-        filled=4,
-        remaining=6,
-    )
-
-    assert state == OrderState.PARTIALLY_FILLED
-
-
-def test_detects_completed_fill_from_quantities():
-    state = normalize_ibkr_status(
-        "Submitted",
-        filled=10,
-        remaining=0,
-    )
-
-    assert state == OrderState.FILLED
-
-
-def test_maps_ibkr_api_cancelled_status():
-    state = normalize_ibkr_status(
-        "ApiCancelled",
-    )
-
-    assert state == OrderState.CANCELLED
-
-
-def test_unknown_ibkr_status_maps_to_error():
-    state = normalize_ibkr_status(
-        "UnexpectedStatus",
-    )
-
-    assert state == OrderState.ERROR
-
-
-def test_next_state_from_ibkr_validates_transition():
-    state = next_state_from_ibkr(
-        current_state=OrderState.SUBMITTED,
-        ibkr_status="Submitted",
-        filled=5,
-        remaining=5,
-    )
-
-    assert state == OrderState.PARTIALLY_FILLED
-
-
-def test_managed_order_reports_active_state():
-    order = ManagedOrder(
-        local_order_id=1,
-        broker_order_id=100,
-        candidate_id=10,
-        symbol="AAPL",
-        action="BUY",
-        quantity=10,
-        order_type="MKT",
-        limit_price=None,
-        state=OrderState.SUBMITTED,
-        remaining_quantity=10,
-    )
-
-    assert order.is_active is True
-    assert order.is_terminal is False
-
-
-def test_managed_order_serializes_enum_values():
-    order = ManagedOrder(
-        local_order_id=1,
-        broker_order_id=None,
-        candidate_id=None,
-        symbol="NVDA",
-        action="BUY",
-        quantity=2,
-        order_type="LMT",
-        limit_price=150.00,
-        state=OrderState.CREATED,
-    )
-
-    data = order.to_dict()
-
-    assert data["state"] == "CREATED"
-    assert data["symbol"] == "NVDA"
-    assert data["paper_only"] is True
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
