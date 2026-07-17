@@ -34,9 +34,14 @@ ALLOWED_TRANSITIONS: dict[
         OrderState.REJECTED,
         OrderState.ERROR,
     },
+    
     OrderState.SUBMITTING: {
         OrderState.PRESUBMITTED,
         OrderState.SUBMITTED,
+        OrderState.PARTIALLY_FILLED,
+        OrderState.FILLED,
+        OrderState.CANCEL_PENDING,
+        OrderState.CANCELLED,
         OrderState.REJECTED,
         OrderState.INACTIVE,
         OrderState.ERROR,
