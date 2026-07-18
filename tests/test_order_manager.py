@@ -18,13 +18,22 @@ def make_order_request(
     quantity: int = 10,
     order_type: str = "MKT",
     limit_price: float | None = None,
+    reference_price: float = 200.0,
 ) -> dict:
+    """
+    Build a prepared paper-order request for OMS tests.
+
+    Market orders do not normally have a limit price, but the portfolio
+    RiskEngine still needs a positive reference price to estimate order
+    value before broker submission.
+    """
     return {
         "symbol": symbol,
         "action": action,
         "quantity": quantity,
         "order_type": order_type,
         "limit_price": limit_price,
+        "price": reference_price,
         "paper_only": True,
         "transmit": False,
     }

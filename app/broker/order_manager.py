@@ -11,20 +11,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from app.broker.ibkr_official import (
-    submit_prepared_paper_order,
-)
-from app.broker.order_state_machine import (
-    normalize_ibkr_status,
-)
-from app.db.order_repository import (
-    OrderRepository,
-)
-from app.models.order_models import (
-    ManagedOrder,
-    OrderState,
-)
-
+from app.broker.ibkr_official import submit_prepared_paper_order
+from app.broker.order_state_machine import normalize_ibkr_status
+from app.db.order_repository import OrderRepository
+from app.models.order_models import ManagedOrder, OrderState
+from app.models.risk_models import PortfolioSnapshot
+from app.services.risk_engine import RiskEngine
 
 BrokerSubmitter = Callable[..., dict[str, Any]]
 
@@ -43,17 +35,18 @@ class OrderManager:
         repository: OrderRepository | None = None,
         *,
         broker_submitter: BrokerSubmitter | None = None,
+        risk_engine: RiskEngine | None = None,
     ) -> None:
         self.repository = (
-            repository
-            if repository is not None
-            else OrderRepository()
+            repository if repository is not None else OrderRepository()
         )
-
         self.broker_submitter = (
             broker_submitter
             if broker_submitter is not None
             else submit_prepared_paper_order
+        )
+        self.risk_engine = (
+            risk_engine if risk_engine is not None else RiskEngine()
         )
 
     @staticmethod
@@ -75,55 +68,38 @@ class OrderManager:
     def _extract_execution_values(
         broker_result: dict[str, Any],
     ) -> dict[str, float]:
-        latest = OrderManager._latest_status(
-            broker_result
-        ) or {}
+        latest = OrderManager._latest_status(broker_result) or {}
 
         filled = float(
             latest.get(
                 "filled",
-                broker_result.get(
-                    "filled",
-                    0,
-                ),
+                broker_result.get("filled", 0),
             )
             or 0
         )
-
         remaining = float(
             latest.get(
                 "remaining",
-                broker_result.get(
-                    "remaining",
-                    0,
-                ),
+                broker_result.get("remaining", 0),
             )
             or 0
         )
-
         average_fill_price = float(
             latest.get(
                 "avgFillPrice",
                 latest.get(
                     "average_fill_price",
-                    broker_result.get(
-                        "average_fill_price",
-                        0,
-                    ),
+                    broker_result.get("average_fill_price", 0),
                 ),
             )
             or 0
         )
-
         last_fill_price = float(
             latest.get(
                 "lastFillPrice",
                 latest.get(
                     "last_fill_price",
-                    broker_result.get(
-                        "last_fill_price",
-                        0,
-                    ),
+                    broker_result.get("last_fill_price", 0),
                 ),
             )
             or 0
@@ -132,28 +108,15 @@ class OrderManager:
         return {
             "filled": max(filled, 0.0),
             "remaining": max(remaining, 0.0),
-            "average_fill_price": max(
-                average_fill_price,
-                0.0,
-            ),
-            "last_fill_price": max(
-                last_fill_price,
-                0.0,
-            ),
+            "average_fill_price": max(average_fill_price, 0.0),
+            "last_fill_price": max(last_fill_price, 0.0),
         }
 
     @staticmethod
-    def _failure_state(
-        status: str,
-    ) -> OrderState:
-        normalized = str(
-            status or ""
-        ).strip().upper()
+    def _failure_state(status: str) -> OrderState:
+        normalized = str(status or "").strip().upper()
 
-        if normalized in {
-            "CANCELLED",
-            "APICANCELLED",
-        }:
+        if normalized in {"CANCELLED", "APICANCELLED"}:
             return OrderState.CANCELLED
 
         if normalized == "INACTIVE":
@@ -173,31 +136,25 @@ class OrderManager:
         self,
         local_order_id: int,
     ) -> ManagedOrder:
-        order = self.repository.transition_order(
+        self.repository.transition_order(
             local_order_id,
             OrderState.VALIDATED,
             source="ORDER_MANAGER",
-            message=(
-                "Prepared order package passed OMS validation."
-            ),
+            message="Prepared order package passed OMS validation.",
         )
 
-        order = self.repository.transition_order(
+        self.repository.transition_order(
             local_order_id,
             OrderState.APPROVED,
             source="ORDER_MANAGER",
-            message=(
-                "Prepared paper order approved for submission."
-            ),
+            message="Prepared paper order approved for submission.",
         )
 
         return self.repository.transition_order(
             local_order_id,
             OrderState.SUBMITTING,
             source="ORDER_MANAGER",
-            message=(
-                "IBKR paper-order submission started."
-            ),
+            message="IBKR paper-order submission started.",
         )
 
     def submit_prepared_order(
@@ -209,9 +166,7 @@ class OrderManager:
         strategy: str | None = None,
         wait_seconds: float = 5.0,
     ) -> dict[str, Any]:
-        """
-        Persist and submit one prepared paper-order package.
-        """
+        """Persist and submit one prepared paper-order package."""
 
         local_order: ManagedOrder | None = None
 
@@ -233,9 +188,7 @@ class OrderManager:
                 "local_order_id": None,
                 "broker_order_id": None,
                 "state": OrderState.REJECTED.value,
-                "message": (
-                    "OMS accepts paper-only prepared orders."
-                ),
+                "message": "OMS accepts paper-only prepared orders.",
             }
 
         try:
@@ -245,14 +198,65 @@ class OrderManager:
                 strategy=strategy,
                 prevent_duplicate=True,
             )
+            local_order_id = int(local_order.local_order_id)
 
-            local_order_id = int(
-                local_order.local_order_id
+            portfolio = PortfolioSnapshot(
+                net_liquidation=100_000.0,
+                buying_power=50_000.0,
+                total_position_value=0.0,
+                open_position_count=0,
+                daily_realized_pnl=0.0,
+                daily_unrealized_pnl=0.0,
+                drawdown_percent=0.0,
+                symbol_position_values={},
             )
 
-            self._transition_initial_lifecycle(
-                local_order_id
+            entry_price = float(
+                order_request.get("limit_price")
+                or order_request.get("price")
+                or 0.0
             )
+
+            risk = self.risk_engine.evaluate_order(
+                symbol=str(order_request.get("symbol", "")),
+                action=str(order_request.get("action", "")),
+                quantity=float(order_request.get("quantity", 0)),
+                entry_price=entry_price,
+                portfolio=portfolio,
+                paper_only=bool(order_request.get("paper_only", True)),
+            )
+
+            if not risk.approved:
+                self.repository.transition_order(
+                    local_order_id,
+                    OrderState.REJECTED,
+                    source="RISK_ENGINE",
+                    message="; ".join(risk.errors),
+                    broker_payload=risk.to_dict(),
+                )
+
+                rejected_order = self.repository.get_order(local_order_id)
+
+                return {
+                    "submitted": False,
+                    "local_order_id": local_order_id,
+                    "broker_order_id": None,
+                    "state": OrderState.REJECTED.value,
+                    "order": (
+                        rejected_order.to_dict()
+                        if rejected_order is not None
+                        else None
+                    ),
+                    "risk": risk.to_dict(),
+                    "events": [
+                        event.to_dict()
+                        for event in self.repository.list_order_events(
+                            local_order_id
+                        )
+                    ],
+                }
+
+            self._transition_initial_lifecycle(local_order_id)
 
             broker_result = self.broker_submitter(
                 order_request,
@@ -265,10 +269,7 @@ class OrderManager:
                     "IBKR submission result must be a dictionary."
                 )
 
-            broker_order_id = broker_result.get(
-                "order_id"
-            )
-
+            broker_order_id = broker_result.get("order_id")
             if broker_order_id is not None:
                 self.repository.set_broker_order_id(
                     local_order_id,
@@ -276,32 +277,16 @@ class OrderManager:
                 )
 
             broker_status = str(
-                broker_result.get(
-                    "status",
-                    "AWAITING_STATUS",
-                )
+                broker_result.get("status", "AWAITING_STATUS")
             ).strip()
-
-            submitted = bool(
-                broker_result.get(
-                    "submitted",
-                    False,
-                )
-            )
-
-            execution = self._extract_execution_values(
-                broker_result
-            )
+            submitted = bool(broker_result.get("submitted", False))
+            execution = self._extract_execution_values(broker_result)
 
             if submitted:
-                current = self.repository.get_order(
-                    local_order_id
-                )
-
+                current = self.repository.get_order(local_order_id)
                 if current is None:
                     raise RuntimeError(
-                        "Managed order disappeared during "
-                        "broker submission."
+                        "Managed order disappeared during broker submission."
                     )
 
                 if execution["filled"] > 0:
@@ -312,17 +297,12 @@ class OrderManager:
                         average_fill_price=execution[
                             "average_fill_price"
                         ],
-                        last_fill_price=execution[
-                            "last_fill_price"
-                        ],
+                        last_fill_price=execution["last_fill_price"],
                         source="IBKR",
                         broker_payload=broker_result,
                     )
                 else:
-                    if (
-                        broker_status.upper()
-                        == "AWAITING_STATUS"
-                    ):
+                    if broker_status.upper() == "AWAITING_STATUS":
                         new_state = OrderState.SUBMITTED
                     else:
                         new_state = normalize_ibkr_status(
@@ -330,7 +310,6 @@ class OrderManager:
                             filled=0,
                             remaining=execution["remaining"],
                         )
-
                         if new_state == OrderState.ERROR:
                             new_state = OrderState.SUBMITTED
 
@@ -345,12 +324,8 @@ class OrderManager:
                             ),
                             broker_payload=broker_result,
                         )
-
             else:
-                failure_state = self._failure_state(
-                    broker_status
-                )
-
+                failure_state = self._failure_state(broker_status)
                 self.repository.transition_order(
                     local_order_id,
                     failure_state,
@@ -362,14 +337,10 @@ class OrderManager:
                     broker_payload=broker_result,
                 )
 
-            final_order = self.repository.get_order(
-                local_order_id
-            )
-
+            final_order = self.repository.get_order(local_order_id)
             if final_order is None:
                 raise RuntimeError(
-                    "Managed order could not be loaded "
-                    "after submission."
+                    "Managed order could not be loaded after submission."
                 )
 
             return {
@@ -421,4 +392,3 @@ class OrderManager:
                 "state": OrderState.ERROR.value,
                 "message": str(exc),
             }
-
