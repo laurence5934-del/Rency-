@@ -18,13 +18,17 @@ import streamlit as st
 from app.dashboard.controllers.dashboard_controller import (
     initialize_dashboard_state,
 )
+
+from app.dashboard.controllers.dashboard_controller import (
+    initialize_dashboard_state,
+)
 from app.dashboard.components.trade_candidate import show_trade_candidate
 from app.dashboard.components.market_scanner import show_market_scanner
 from app.dashboard.components.approval_queue_dashboard import (
     show_approval_queue_dashboard,
 )
 from app.dashboard.components.live_positions import show_live_positions
-from app.dashboard.components.portfolio_intelligence import show_portfolio_intelligence
+from app.dashboard.components.portfolio_summary import show_portfolio_summary
 from app.dashboard.components.opportunity_card import(show_opportunity_card,)
 from app.dashboard.components.open_orders import show_open_orders
 from app.dashboard.components.approval_queue import show_approval_queue
@@ -139,12 +143,68 @@ account_data = safe_account_summary()
 positions_data = safe_positions()
 
 
-show_portfolio_intelligence(
-    account_data,
-    positions_data,
-)
+st.subheader("IBKR Paper Account Summary")
+
+summary = account_data.get("summary", [])
+
+if summary:
+    df_summary = pd.DataFrame(summary)
+
+    def get_account_value(tag: str):
+        matching_rows = df_summary[df_summary["tag"] == tag]
+
+        if matching_rows.empty:
+            return None
+
+        return matching_rows.iloc[0]["value"]
+
+    net_liquidation = get_account_value("NetLiquidation")
+    available_funds = get_account_value("AvailableFunds")
+    buying_power = get_account_value("BuyingPower")
+    total_cash = get_account_value("TotalCashValue")
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "Net Liquidation",
+        format_money(net_liquidation),
+    )
+
+    c2.metric(
+        "Available Funds",
+        format_money(available_funds),
+    )
+
+    c3.metric(
+        "Buying Power",
+        format_money(buying_power),
+    )
+
+    c4.metric(
+        "Cash",
+        format_money(total_cash),
+    )
+
+    with st.expander("View raw account data"):
+        st.dataframe(
+            df_summary,
+            width="stretch",
+            hide_index=True,
+        )
+
+else:
+    error_message = account_data.get(
+        "error",
+        "No account summary received.",
+    )
+
+    st.warning(
+        f"IBKR account information is unavailable: {error_message}"
+    )
+
 
 st.divider()
+
 
 st.subheader("🤖 AI Signal Center")
 
@@ -331,6 +391,9 @@ st.divider()
 
 st.divider()
 show_open_orders()
+
+st.divider()
+show_portfolio_summary(account_data)
 
 st.divider()
 show_live_positions(positions_data)

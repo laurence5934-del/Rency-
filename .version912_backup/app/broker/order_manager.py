@@ -1,6 +1,6 @@
 """
 OMS Order Manager
-AI Trading Platform Version 9.2
+AI Trading Platform Version 7.7
 
 Coordinates validated paper-order submission through the
 persistent OMS repository and the IBKR broker adapter.
@@ -15,11 +15,10 @@ from app.broker.ibkr_official import submit_prepared_paper_order
 from app.broker.order_state_machine import normalize_ibkr_status
 from app.db.order_repository import OrderRepository
 from app.models.order_models import ManagedOrder, OrderState
-from app.models.portfolio_risk_models import PortfolioSnapshot
-from app.risk.portfolio_risk_manager import evaluate_portfolio_risk
+from app.models.risk_models import PortfolioSnapshot
+from app.services.risk_engine import RiskEngine
 
 BrokerSubmitter = Callable[..., dict[str, Any]]
-RiskEvaluator = Callable[..., Any]
 
 
 class OrderManager:
@@ -36,7 +35,7 @@ class OrderManager:
         repository: OrderRepository | None = None,
         *,
         broker_submitter: BrokerSubmitter | None = None,
-        risk_evaluator: RiskEvaluator | None = None,
+        risk_engine: RiskEngine | None = None,
     ) -> None:
         self.repository = (
             repository if repository is not None else OrderRepository()
@@ -46,10 +45,8 @@ class OrderManager:
             if broker_submitter is not None
             else submit_prepared_paper_order
         )
-        self.risk_evaluator = (
-            risk_evaluator
-            if risk_evaluator is not None
-            else evaluate_portfolio_risk
+        self.risk_engine = (
+            risk_engine if risk_engine is not None else RiskEngine()
         )
 
     @staticmethod
@@ -113,42 +110,6 @@ class OrderManager:
             "remaining": max(remaining, 0.0),
             "average_fill_price": max(average_fill_price, 0.0),
             "last_fill_price": max(last_fill_price, 0.0),
-        }
-
-    @staticmethod
-    def _risk_payload(risk: Any) -> dict[str, Any]:
-        to_dict = getattr(risk, "to_dict", None)
-        if callable(to_dict):
-            payload = to_dict()
-            if isinstance(payload, dict):
-                return payload
-
-        def enum_value(value: Any) -> Any:
-            return getattr(value, "value", value)
-
-        return {
-            "approved": bool(getattr(risk, "approved", False)),
-            "decision": enum_value(getattr(risk, "decision", None)),
-            "symbol": getattr(risk, "symbol", ""),
-            "action": getattr(risk, "action", ""),
-            "quantity": getattr(risk, "quantity", 0),
-            "entry_price": getattr(risk, "entry_price", 0.0),
-            "order_value": getattr(risk, "order_value", 0.0),
-            "projected_symbol_value": getattr(
-                risk, "projected_symbol_value", 0.0
-            ),
-            "projected_portfolio_value": getattr(
-                risk, "projected_portfolio_value", 0.0
-            ),
-            "projected_exposure_percent": getattr(
-                risk, "projected_exposure_percent", 0.0
-            ),
-            "errors": list(getattr(risk, "errors", ())),
-            "warnings": list(getattr(risk, "warnings", ())),
-            "codes": [
-                enum_value(code)
-                for code in getattr(risk, "codes", ())
-            ],
         }
 
     @staticmethod
@@ -256,34 +217,22 @@ class OrderManager:
                 or 0.0
             )
 
-            candidate = {
-                "symbol": str(order_request.get("symbol", "")),
-                "action": str(order_request.get("action", "")),
-                "quantity": int(order_request.get("quantity", 0) or 0),
-                "entry_price": entry_price,
-            }
-
-            risk = self.risk_evaluator(
-                candidate=candidate,
+            risk = self.risk_engine.evaluate_order(
+                symbol=str(order_request.get("symbol", "")),
+                action=str(order_request.get("action", "")),
+                quantity=float(order_request.get("quantity", 0)),
+                entry_price=entry_price,
                 portfolio=portfolio,
-                paper_trading_only=bool(
-                    order_request.get("paper_only", True)
-                ),
-                emergency_lock_active=False,
+                paper_only=bool(order_request.get("paper_only", True)),
             )
-            risk_payload = self._risk_payload(risk)
 
-            if not bool(getattr(risk, "approved", False)):
-                risk_errors = list(getattr(risk, "errors", ()))
+            if not risk.approved:
                 self.repository.transition_order(
                     local_order_id,
                     OrderState.REJECTED,
-                    source="PORTFOLIO_RISK_MANAGER",
-                    message=(
-                        "; ".join(str(error) for error in risk_errors)
-                        or "Portfolio risk evaluation rejected the order."
-                    ),
-                    broker_payload=risk_payload,
+                    source="RISK_ENGINE",
+                    message="; ".join(risk.errors),
+                    broker_payload=risk.to_dict(),
                 )
 
                 rejected_order = self.repository.get_order(local_order_id)
@@ -298,7 +247,7 @@ class OrderManager:
                         if rejected_order is not None
                         else None
                     ),
-                    "risk": risk_payload,
+                    "risk": risk.to_dict(),
                     "events": [
                         event.to_dict()
                         for event in self.repository.list_order_events(
@@ -401,7 +350,6 @@ class OrderManager:
                 "state": final_order.state.value,
                 "order": final_order.to_dict(),
                 "broker_result": broker_result,
-                "risk": risk_payload,
                 "events": [
                     event.to_dict()
                     for event in self.repository.list_order_events(

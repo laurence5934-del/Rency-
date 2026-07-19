@@ -1,0 +1,1263 @@
+===== app\broker\order_manager.py =====
+"""
+OMS Order Manager
+AI Trading Platform Version 7.7
+
+Coordinates validated paper-order submission through the
+persistent OMS repository and the IBKR broker adapter.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
+
+from app.broker.ibkr_official import submit_prepared_paper_order
+from app.broker.order_state_machine import normalize_ibkr_status
+from app.db.order_repository import OrderRepository
+from app.models.order_models import ManagedOrder, OrderState
+from app.models.portfolio_risk_models import PortfolioSnapshot
+from app.services.risk_engine import RiskEngine
+
+BrokerSubmitter = Callable[..., dict[str, Any]]
+
+
+class OrderManager:
+    """
+    Persistent paper-order submission coordinator.
+
+    The manager records the order before calling IBKR so that
+    attempted submissions remain auditable even if the broker
+    connection fails.
+    """
+
+    def __init__(
+        self,
+        repository: OrderRepository | None = None,
+        *,
+        broker_submitter: BrokerSubmitter | None = None,
+        risk_engine: RiskEngine | None = None,
+    ) -> None:
+        self.repository = (
+            repository if repository is not None else OrderRepository()
+        )
+        self.broker_submitter = (
+            broker_submitter
+            if broker_submitter is not None
+            else submit_prepared_paper_order
+        )
+        self.risk_engine = (
+            risk_engine if risk_engine is not None else RiskEngine()
+        )
+
+    @staticmethod
+    def _latest_status(
+        broker_result: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        statuses = broker_result.get("statuses", [])
+
+        if not isinstance(statuses, list):
+            return None
+
+        for item in reversed(statuses):
+            if isinstance(item, dict):
+                return item
+
+        return None
+
+    @staticmethod
+    def _extract_execution_values(
+        broker_result: dict[str, Any],
+    ) -> dict[str, float]:
+        latest = OrderManager._latest_status(broker_result) or {}
+
+        filled = float(
+            latest.get(
+                "filled",
+                broker_result.get("filled", 0),
+            )
+            or 0
+        )
+        remaining = float(
+            latest.get(
+                "remaining",
+                broker_result.get("remaining", 0),
+            )
+            or 0
+        )
+        average_fill_price = float(
+            latest.get(
+                "avgFillPrice",
+                latest.get(
+                    "average_fill_price",
+                    broker_result.get("average_fill_price", 0),
+                ),
+            )
+            or 0
+        )
+        last_fill_price = float(
+            latest.get(
+                "lastFillPrice",
+                latest.get(
+                    "last_fill_price",
+                    broker_result.get("last_fill_price", 0),
+                ),
+            )
+            or 0
+        )
+
+        return {
+            "filled": max(filled, 0.0),
+            "remaining": max(remaining, 0.0),
+            "average_fill_price": max(average_fill_price, 0.0),
+            "last_fill_price": max(last_fill_price, 0.0),
+        }
+
+    @staticmethod
+    def _failure_state(status: str) -> OrderState:
+        normalized = str(status or "").strip().upper()
+
+        if normalized in {"CANCELLED", "APICANCELLED"}:
+            return OrderState.CANCELLED
+
+        if normalized == "INACTIVE":
+            return OrderState.INACTIVE
+
+        if normalized in {
+            "LIVE_TRADING_BLOCKED",
+            "PAPER_CONFIRMATION_REQUIRED",
+            "NON_PAPER_ORDER_BLOCKED",
+            "UNSAFE_PREVIEW_PACKAGE",
+        }:
+            return OrderState.REJECTED
+
+        return OrderState.ERROR
+
+    def _transition_initial_lifecycle(
+        self,
+        local_order_id: int,
+    ) -> ManagedOrder:
+        self.repository.transition_order(
+            local_order_id,
+            OrderState.VALIDATED,
+            source="ORDER_MANAGER",
+            message="Prepared order package passed OMS validation.",
+        )
+
+        self.repository.transition_order(
+            local_order_id,
+            OrderState.APPROVED,
+            source="ORDER_MANAGER",
+            message="Prepared paper order approved for submission.",
+        )
+
+        return self.repository.transition_order(
+            local_order_id,
+            OrderState.SUBMITTING,
+            source="ORDER_MANAGER",
+            message="IBKR paper-order submission started.",
+        )
+
+    def submit_prepared_order(
+        self,
+        order_request: dict[str, Any],
+        *,
+        paper_account_confirmed: bool,
+        candidate_id: int | None = None,
+        strategy: str | None = None,
+        wait_seconds: float = 5.0,
+    ) -> dict[str, Any]:
+        """Persist and submit one prepared paper-order package."""
+
+        local_order: ManagedOrder | None = None
+
+        if bool(order_request.get("transmit", True)):
+            return {
+                "submitted": False,
+                "local_order_id": None,
+                "broker_order_id": None,
+                "state": OrderState.REJECTED.value,
+                "message": (
+                    "Unsafe preview package blocked. "
+                    "Prepared orders must contain transmit=False."
+                ),
+            }
+
+        if not bool(order_request.get("paper_only", False)):
+            return {
+                "submitted": False,
+                "local_order_id": None,
+                "broker_order_id": None,
+                "state": OrderState.REJECTED.value,
+                "message": "OMS accepts paper-only prepared orders.",
+            }
+
+        try:
+            local_order = self.repository.create_order(
+                order_request,
+                candidate_id=candidate_id,
+                strategy=strategy,
+                prevent_duplicate=True,
+            )
+            local_order_id = int(local_order.local_order_id)
+
+            portfolio = PortfolioSnapshot(
+                net_liquidation=100_000.0,
+                buying_power=50_000.0,
+                total_position_value=0.0,
+                open_position_count=0,
+                daily_realized_pnl=0.0,
+                daily_unrealized_pnl=0.0,
+                drawdown_percent=0.0,
+                symbol_position_values={},
+            )
+
+            entry_price = float(
+                order_request.get("limit_price")
+                or order_request.get("price")
+                or 0.0
+            )
+
+            risk = self.risk_engine.evaluate_order(
+                symbol=str(order_request.get("symbol", "")),
+                action=str(order_request.get("action", "")),
+                quantity=float(order_request.get("quantity", 0)),
+                entry_price=entry_price,
+                portfolio=portfolio,
+                paper_only=bool(order_request.get("paper_only", True)),
+            )
+
+            if not risk.approved:
+                self.repository.transition_order(
+                    local_order_id,
+                    OrderState.REJECTED,
+                    source="RISK_ENGINE",
+                    message="; ".join(risk.errors),
+                    broker_payload=risk.to_dict(),
+                )
+
+                rejected_order = self.repository.get_order(local_order_id)
+
+                return {
+                    "submitted": False,
+                    "local_order_id": local_order_id,
+                    "broker_order_id": None,
+                    "state": OrderState.REJECTED.value,
+                    "order": (
+                        rejected_order.to_dict()
+                        if rejected_order is not None
+                        else None
+                    ),
+                    "risk": risk.to_dict(),
+                    "events": [
+                        event.to_dict()
+                        for event in self.repository.list_order_events(
+                            local_order_id
+                        )
+                    ],
+                }
+
+            self._transition_initial_lifecycle(local_order_id)
+
+            broker_result = self.broker_submitter(
+                order_request,
+                paper_account_confirmed=paper_account_confirmed,
+                wait_seconds=wait_seconds,
+            )
+
+            if not isinstance(broker_result, dict):
+                raise TypeError(
+                    "IBKR submission result must be a dictionary."
+                )
+
+            broker_order_id = broker_result.get("order_id")
+            if broker_order_id is not None:
+                self.repository.set_broker_order_id(
+                    local_order_id,
+                    int(broker_order_id),
+                )
+
+            broker_status = str(
+                broker_result.get("status", "AWAITING_STATUS")
+            ).strip()
+            submitted = bool(broker_result.get("submitted", False))
+            execution = self._extract_execution_values(broker_result)
+
+            if submitted:
+                current = self.repository.get_order(local_order_id)
+                if current is None:
+                    raise RuntimeError(
+                        "Managed order disappeared during broker submission."
+                    )
+
+                if execution["filled"] > 0:
+                    self.repository.update_execution(
+                        local_order_id,
+                        filled_quantity=execution["filled"],
+                        remaining_quantity=execution["remaining"],
+                        average_fill_price=execution[
+                            "average_fill_price"
+                        ],
+                        last_fill_price=execution["last_fill_price"],
+                        source="IBKR",
+                        broker_payload=broker_result,
+                    )
+                else:
+                    if broker_status.upper() == "AWAITING_STATUS":
+                        new_state = OrderState.SUBMITTED
+                    else:
+                        new_state = normalize_ibkr_status(
+                            broker_status,
+                            filled=0,
+                            remaining=execution["remaining"],
+                        )
+                        if new_state == OrderState.ERROR:
+                            new_state = OrderState.SUBMITTED
+
+                    if new_state != current.state:
+                        self.repository.transition_order(
+                            local_order_id,
+                            new_state,
+                            source="IBKR",
+                            message=(
+                                "Initial broker submission status "
+                                f"received: {broker_status}."
+                            ),
+                            broker_payload=broker_result,
+                        )
+            else:
+                failure_state = self._failure_state(broker_status)
+                self.repository.transition_order(
+                    local_order_id,
+                    failure_state,
+                    source="IBKR",
+                    message=(
+                        "IBKR paper-order submission failed: "
+                        f"{broker_status}."
+                    ),
+                    broker_payload=broker_result,
+                )
+
+            final_order = self.repository.get_order(local_order_id)
+            if final_order is None:
+                raise RuntimeError(
+                    "Managed order could not be loaded after submission."
+                )
+
+            return {
+                "submitted": submitted,
+                "local_order_id": final_order.local_order_id,
+                "broker_order_id": final_order.broker_order_id,
+                "state": final_order.state.value,
+                "order": final_order.to_dict(),
+                "broker_result": broker_result,
+                "events": [
+                    event.to_dict()
+                    for event in self.repository.list_order_events(
+                        local_order_id
+                    )
+                ],
+            }
+
+        except Exception as exc:
+            if (
+                local_order is not None
+                and local_order.local_order_id is not None
+            ):
+                current = self.repository.get_order(
+                    local_order.local_order_id
+                )
+
+                if current is not None and not current.is_terminal:
+                    try:
+                        self.repository.transition_order(
+                            current.local_order_id,
+                            OrderState.ERROR,
+                            source="ORDER_MANAGER",
+                            message=str(exc),
+                            broker_payload={
+                                "exception_type": type(exc).__name__,
+                            },
+                        )
+                    except Exception:
+                        pass
+
+            return {
+                "submitted": False,
+                "local_order_id": (
+                    local_order.local_order_id
+                    if local_order is not None
+                    else None
+                ),
+                "broker_order_id": None,
+                "state": OrderState.ERROR.value,
+                "message": str(exc),
+            }
+
+===== tests\test_order_manager.py =====
+import pytest
+
+from app.broker.order_manager import (
+    OrderManager,
+)
+from app.db.order_repository import (
+    OrderRepository,
+)
+from app.models.order_models import (
+    OrderState,
+)
+
+
+def make_order_request(
+    *,
+    symbol: str = "AAPL",
+    action: str = "BUY",
+    quantity: int = 10,
+    order_type: str = "MKT",
+    limit_price: float | None = None,
+    reference_price: float = 200.0,
+) -> dict:
+    """
+    Build a prepared paper-order request for OMS tests.
+
+    Market orders do not normally have a limit price, but the portfolio
+    RiskEngine still needs a positive reference price to estimate order
+    value before broker submission.
+    """
+    return {
+        "symbol": symbol,
+        "action": action,
+        "quantity": quantity,
+        "order_type": order_type,
+        "limit_price": limit_price,
+        "price": reference_price,
+        "paper_only": True,
+        "transmit": False,
+    }
+
+
+@pytest.fixture
+def repository(
+    tmp_path,
+) -> OrderRepository:
+    return OrderRepository(
+        tmp_path / "order_manager_test.db"
+    )
+
+
+def test_submits_and_persists_order(
+    repository,
+):
+    def fake_submitter(
+        order_request,
+        *,
+        paper_account_confirmed,
+        wait_seconds,
+    ):
+        assert paper_account_confirmed is True
+        assert wait_seconds == 2.0
+
+        return {
+            "submitted": True,
+            "status": "Submitted",
+            "order_id": 5001,
+            "statuses": [
+                {
+                    "orderId": 5001,
+                    "status": "Submitted",
+                    "filled": 0,
+                    "remaining": 10,
+                    "avgFillPrice": 0,
+                    "lastFillPrice": 0,
+                }
+            ],
+            "fills": [],
+            "errors": [],
+        }
+
+    manager = OrderManager(
+        repository,
+        broker_submitter=fake_submitter,
+    )
+
+    result = manager.submit_prepared_order(
+        make_order_request(),
+        paper_account_confirmed=True,
+        candidate_id=101,
+        strategy="BREAKOUT",
+        wait_seconds=2.0,
+    )
+
+    assert result["submitted"] is True
+    assert result["broker_order_id"] == 5001
+    assert result["state"] == "SUBMITTED"
+
+    stored = repository.get_order(
+        result["local_order_id"]
+    )
+
+    assert stored is not None
+    assert stored.broker_order_id == 5001
+    assert stored.candidate_id == 101
+    assert stored.strategy == "BREAKOUT"
+    assert stored.state == OrderState.SUBMITTED
+
+
+def test_records_complete_lifecycle_events(
+    repository,
+):
+    def fake_submitter(*args, **kwargs):
+        return {
+            "submitted": True,
+            "status": "Submitted",
+            "order_id": 5002,
+            "statuses": [
+                {
+                    "orderId": 5002,
+                    "status": "Submitted",
+                    "filled": 0,
+                    "remaining": 10,
+                }
+            ],
+        }
+
+    manager = OrderManager(
+        repository,
+        broker_submitter=fake_submitter,
+    )
+
+    result = manager.submit_prepared_order(
+        make_order_request(),
+        paper_account_confirmed=True,
+    )
+
+    events = repository.list_order_events(
+        result["local_order_id"]
+    )
+
+    assert [
+        event.new_state
+        for event in events
+    ] == [
+        OrderState.CREATED,
+        OrderState.VALIDATED,
+        OrderState.APPROVED,
+        OrderState.SUBMITTING,
+        OrderState.SUBMITTED,
+    ]
+
+
+def test_handles_presubmitted_status(
+    repository,
+):
+    def fake_submitter(*args, **kwargs):
+        return {
+            "submitted": True,
+            "status": "PreSubmitted",
+            "order_id": 5003,
+            "statuses": [
+                {
+                    "orderId": 5003,
+                    "status": "PreSubmitted",
+                    "filled": 0,
+                    "remaining": 10,
+                }
+            ],
+        }
+
+    manager = OrderManager(
+        repository,
+        broker_submitter=fake_submitter,
+    )
+
+    result = manager.submit_prepared_order(
+        make_order_request(),
+        paper_account_confirmed=True,
+    )
+
+    assert result["state"] == "PRESUBMITTED"
+
+
+def test_handles_awaiting_status_as_submitted(
+    repository,
+):
+    def fake_submitter(*args, **kwargs):
+        return {
+            "submitted": True,
+            "status": "AWAITING_STATUS",
+            "order_id": 5004,
+            "statuses": [],
+        }
+
+    manager = OrderManager(
+        repository,
+        broker_submitter=fake_submitter,
+    )
+
+    result = manager.submit_prepared_order(
+        make_order_request(),
+        paper_account_confirmed=True,
+    )
+
+    assert result["submitted"] is True
+    assert result["state"] == "SUBMITTED"
+
+
+def test_records_partial_fill(
+    repository,
+):
+    def fake_submitter(*args, **kwargs):
+        return {
+            "submitted": True,
+            "status": "Submitted",
+            "order_id": 5005,
+            "statuses": [
+                {
+                    "orderId": 5005,
+                    "status": "Submitted",
+                    "filled": 4,
+                    "remaining": 6,
+                    "avgFillPrice": 199.50,
+                    "lastFillPrice": 199.75,
+                }
+            ],
+        }
+
+    manager = OrderManager(
+        repository,
+        broker_submitter=fake_submitter,
+    )
+
+    result = manager.submit_prepared_order(
+        make_order_request(),
+        paper_account_confirmed=True,
+    )
+
+    assert result["state"] == "PARTIALLY_FILLED"
+
+    order = repository.get_order(
+        result["local_order_id"]
+    )
+
+    assert order is not None
+    assert order.filled_quantity == 4
+    assert order.remaining_quantity == 6
+    assert order.average_fill_price == 199.50
+    assert order.last_fill_price == 199.75
+
+
+def test_records_complete_fill(
+    repository,
+):
+    def fake_submitter(*args, **kwargs):
+        return {
+            "submitted": True,
+            "status": "Filled",
+            "order_id": 5006,
+            "statuses": [
+                {
+                    "orderId": 5006,
+                    "status": "Filled",
+                    "filled": 10,
+                    "remaining": 0,
+                    "avgFillPrice": 200.10,
+                    "lastFillPrice": 200.10,
+                }
+            ],
+        }
+
+    manager = OrderManager(
+        repository,
+        broker_submitter=fake_submitter,
+    )
+
+    result = manager.submit_prepared_order(
+        make_order_request(),
+        paper_account_confirmed=True,
+    )
+
+    assert result["state"] == "FILLED"
+
+    order = repository.get_order(
+        result["local_order_id"]
+    )
+
+    assert order is not None
+    assert order.is_terminal is True
+    assert order.filled_quantity == 10
+
+
+def test_maps_cancelled_submission(
+    repository,
+):
+    def fake_submitter(*args, **kwargs):
+        return {
+            "submitted": False,
+            "status": "Cancelled",
+            "order_id": 5007,
+            "statuses": [],
+        }
+
+    manager = OrderManager(
+        repository,
+        broker_submitter=fake_submitter,
+    )
+
+    result = manager.submit_prepared_order(
+        make_order_request(),
+        paper_account_confirmed=True,
+    )
+
+    assert result["submitted"] is False
+    assert result["state"] == "CANCELLED"
+
+
+def test_maps_inactive_submission(
+    repository,
+):
+    def fake_submitter(*args, **kwargs):
+        return {
+            "submitted": False,
+            "status": "Inactive",
+            "order_id": 5008,
+            "statuses": [],
+        }
+
+    manager = OrderManager(
+        repository,
+        broker_submitter=fake_submitter,
+    )
+
+    result = manager.submit_prepared_order(
+        make_order_request(),
+        paper_account_confirmed=True,
+    )
+
+    assert result["state"] == "INACTIVE"
+
+
+def test_maps_guard_rejection(
+    repository,
+):
+    def fake_submitter(*args, **kwargs):
+        return {
+            "submitted": False,
+            "status": "PAPER_CONFIRMATION_REQUIRED",
+        }
+
+    manager = OrderManager(
+        repository,
+        broker_submitter=fake_submitter,
+    )
+
+    result = manager.submit_prepared_order(
+        make_order_request(),
+        paper_account_confirmed=False,
+    )
+
+    assert result["state"] == "REJECTED"
+
+
+def test_maps_unexpected_failure_to_error(
+    repository,
+):
+    def fake_submitter(*args, **kwargs):
+        return {
+            "submitted": False,
+            "status": "BROKER_FAILURE",
+        }
+
+    manager = OrderManager(
+        repository,
+        broker_submitter=fake_submitter,
+    )
+
+    result = manager.submit_prepared_order(
+        make_order_request(),
+        paper_account_confirmed=True,
+    )
+
+    assert result["state"] == "ERROR"
+
+
+def test_handles_broker_exception(
+    repository,
+):
+    def fake_submitter(*args, **kwargs):
+        raise ConnectionError(
+            "TWS connection failed."
+        )
+
+    manager = OrderManager(
+        repository,
+        broker_submitter=fake_submitter,
+    )
+
+    result = manager.submit_prepared_order(
+        make_order_request(),
+        paper_account_confirmed=True,
+    )
+
+    assert result["submitted"] is False
+    assert result["state"] == "ERROR"
+    assert "TWS connection failed" in (
+        result["message"]
+    )
+
+    order = repository.get_order(
+        result["local_order_id"]
+    )
+
+    assert order is not None
+    assert order.state == OrderState.ERROR
+
+
+def test_prevents_duplicate_active_submission(
+    repository,
+):
+    calls = 0
+
+    def fake_submitter(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+
+        return {
+            "submitted": True,
+            "status": "Submitted",
+            "order_id": 6000 + calls,
+            "statuses": [
+                {
+                    "orderId": 6000 + calls,
+                    "status": "Submitted",
+                    "filled": 0,
+                    "remaining": 10,
+                }
+            ],
+        }
+
+    manager = OrderManager(
+        repository,
+        broker_submitter=fake_submitter,
+    )
+
+    first = manager.submit_prepared_order(
+        make_order_request(),
+        paper_account_confirmed=True,
+        strategy="MOMENTUM",
+    )
+
+    second = manager.submit_prepared_order(
+        make_order_request(),
+        paper_account_confirmed=True,
+        strategy="MOMENTUM",
+    )
+
+    assert first["submitted"] is True
+    assert second["submitted"] is False
+    assert "active duplicate order" in (
+        second["message"]
+    )
+    assert calls == 1
+
+
+def test_allows_new_order_after_terminal_order(
+    repository,
+):
+    calls = 0
+
+    def fake_submitter(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+
+        return {
+            "submitted": True,
+            "status": "Filled",
+            "order_id": 7000 + calls,
+            "statuses": [
+                {
+                    "orderId": 7000 + calls,
+                    "status": "Filled",
+                    "filled": 10,
+                    "remaining": 0,
+                    "avgFillPrice": 200,
+                    "lastFillPrice": 200,
+                }
+            ],
+        }
+
+    manager = OrderManager(
+        repository,
+        broker_submitter=fake_submitter,
+    )
+
+    first = manager.submit_prepared_order(
+        make_order_request(),
+        paper_account_confirmed=True,
+        strategy="MOMENTUM",
+    )
+
+    second = manager.submit_prepared_order(
+        make_order_request(),
+        paper_account_confirmed=True,
+        strategy="MOMENTUM",
+    )
+
+    assert first["state"] == "FILLED"
+    assert second["submitted"] is True
+    assert calls == 2
+
+
+def test_rejects_unsafe_transmitting_preview(
+    repository,
+):
+    request = make_order_request()
+    request["transmit"] = True
+
+    def fake_submitter(*args, **kwargs):
+        pytest.fail(
+            "Broker submitter should not be called."
+        )
+
+    manager = OrderManager(
+        repository,
+        broker_submitter=fake_submitter,
+    )
+
+    result = manager.submit_prepared_order(
+        request,
+        paper_account_confirmed=True,
+    )
+
+    # Repository currently validates paper_only but the broker
+    # adapter is responsible for rejecting transmit=True.
+    # This test confirms the broker result is recorded safely
+    # when the submitter is replaced in future integration tests.
+    assert result["submitted"] is False
+
+===== app\risk\portfolio_risk_manager.py =====
+"""
+Portfolio Risk Manager
+AI Trading Platform Version 7.5
+
+Performs portfolio-level checks before an approved candidate
+can move to the paper-execution guard and order builder.
+
+This module does not transmit orders.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from app.models.portfolio_risk_models import (
+    PortfolioRiskLimits,
+    PortfolioRiskResult,
+    PortfolioSnapshot,
+    RiskCode,
+    RiskDecision,
+)
+
+
+def evaluate_portfolio_risk(
+    *,
+    candidate: dict[str, Any],
+    portfolio: PortfolioSnapshot,
+    limits: PortfolioRiskLimits | None = None,
+    paper_trading_only: bool = True,
+    emergency_lock_active: bool = False,
+) -> PortfolioRiskResult:
+    configured_limits = limits or PortfolioRiskLimits()
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    codes: list[RiskCode] = []
+
+    symbol = str(
+        candidate.get("symbol", "")
+    ).strip().upper()
+
+    action = str(
+        candidate.get("action", "")
+    ).strip().upper()
+
+    quantity = int(
+        candidate.get("quantity", 0) or 0
+    )
+
+    entry_price = float(
+        candidate.get("entry_price", 0) or 0
+    )
+
+    order_value = max(
+        quantity * entry_price,
+        0.0,
+    )
+
+    existing_symbol_value = float(
+        portfolio.symbol_position_values.get(
+            symbol,
+            0.0,
+        )
+    )
+
+    if action == "BUY":
+        projected_symbol_value = (
+            existing_symbol_value + order_value
+        )
+        projected_portfolio_value = (
+            float(portfolio.total_position_value)
+            + order_value
+        )
+    elif action == "SELL":
+        projected_symbol_value = max(
+            existing_symbol_value - order_value,
+            0.0,
+        )
+        projected_portfolio_value = max(
+            float(portfolio.total_position_value)
+            - order_value,
+            0.0,
+        )
+    else:
+        projected_symbol_value = existing_symbol_value
+        projected_portfolio_value = float(
+            portfolio.total_position_value
+        )
+
+    if portfolio.net_liquidation > 0:
+        projected_exposure_percent = (
+            projected_portfolio_value
+            / portfolio.net_liquidation
+            * 100.0
+        )
+    else:
+        projected_exposure_percent = 0.0
+
+    if not paper_trading_only:
+        errors.append(
+            "Portfolio risk approval requires "
+            "paper-trading-only mode."
+        )
+        codes.append(
+            RiskCode.PAPER_TRADING_REQUIRED
+        )
+
+    if emergency_lock_active:
+        errors.append(
+            "The emergency trading lock is active."
+        )
+        codes.append(
+            RiskCode.EMERGENCY_LOCK_ACTIVE
+        )
+
+    if not symbol:
+        errors.append(
+            "Candidate symbol is missing."
+        )
+        codes.append(
+            RiskCode.INVALID_SYMBOL
+        )
+
+    if action not in {"BUY", "SELL"}:
+        errors.append(
+            "Candidate action must be BUY or SELL."
+        )
+        codes.append(
+            RiskCode.INVALID_ACTION
+        )
+
+    if quantity <= 0:
+        errors.append(
+            "Candidate quantity must be greater than zero."
+        )
+        codes.append(
+            RiskCode.INVALID_QUANTITY
+        )
+
+    if entry_price <= 0:
+        errors.append(
+            "Candidate entry price must be greater than zero."
+        )
+        codes.append(
+            RiskCode.INVALID_ENTRY_PRICE
+        )
+
+    if portfolio.net_liquidation <= 0:
+        errors.append(
+            "Net liquidation value must be greater than zero."
+        )
+        codes.append(
+            RiskCode.INVALID_ACCOUNT_VALUE
+        )
+
+    if (
+        order_value
+        > configured_limits.maximum_order_value
+    ):
+        errors.append(
+            "Planned order value exceeds the configured "
+            f"maximum of "
+            f"${configured_limits.maximum_order_value:,.2f}."
+        )
+        codes.append(
+            RiskCode.ORDER_VALUE_EXCEEDED
+        )
+
+    if (
+        projected_symbol_value
+        > configured_limits.maximum_position_value
+    ):
+        errors.append(
+            "Projected symbol position exceeds the "
+            f"configured maximum of "
+            f"${configured_limits.maximum_position_value:,.2f}."
+        )
+        codes.append(
+            RiskCode.POSITION_VALUE_EXCEEDED
+        )
+
+    if (
+        projected_exposure_percent
+        > configured_limits
+        .maximum_portfolio_exposure_percent
+    ):
+        errors.append(
+            "Projected portfolio exposure exceeds the "
+            f"configured maximum of "
+            f"{configured_limits.maximum_portfolio_exposure_percent:.2f}%."
+        )
+        codes.append(
+            RiskCode.PORTFOLIO_EXPOSURE_EXCEEDED
+        )
+
+    adding_new_position = (
+        action == "BUY"
+        and existing_symbol_value <= 0
+    )
+
+    if (
+        adding_new_position
+        and portfolio.open_position_count
+        >= configured_limits.maximum_open_positions
+    ):
+        errors.append(
+            "Maximum number of open positions has "
+            "already been reached."
+        )
+        codes.append(
+            RiskCode.OPEN_POSITION_LIMIT_REACHED
+        )
+
+    if (
+        action == "BUY"
+        and portfolio.buying_power - order_value
+        < configured_limits.minimum_buying_power
+    ):
+        errors.append(
+            "The order would reduce buying power below "
+            f"${configured_limits.minimum_buying_power:,.2f}."
+        )
+        codes.append(
+            RiskCode.BUYING_POWER_INSUFFICIENT
+        )
+
+    if (
+        portfolio.daily_total_pnl
+        <= -abs(
+            configured_limits.maximum_daily_loss
+        )
+    ):
+        errors.append(
+            "The configured daily loss limit has "
+            "been reached."
+        )
+        codes.append(
+            RiskCode.DAILY_LOSS_LIMIT_REACHED
+        )
+
+    if (
+        portfolio.drawdown_percent
+        >= configured_limits.maximum_drawdown_percent
+    ):
+        errors.append(
+            "The configured maximum drawdown limit "
+            "has been reached."
+        )
+        codes.append(
+            RiskCode.MAXIMUM_DRAWDOWN_REACHED
+        )
+
+    if (
+        action == "BUY"
+        and existing_symbol_value > 0
+        and not configured_limits
+        .allow_existing_symbol_additions
+    ):
+        errors.append(
+            f"An existing position already exists for "
+            f"{symbol}. Additional exposure is disabled."
+        )
+        codes.append(
+            RiskCode.EXISTING_SYMBOL_EXPOSURE
+        )
+
+    if (
+        configured_limits.maximum_order_value > 0
+        and order_value
+        >= configured_limits.maximum_order_value * 0.8
+    ):
+        warnings.append(
+            "Planned order value is at least 80% of "
+            "the configured maximum order value."
+        )
+
+    if (
+        configured_limits.maximum_position_value > 0
+        and projected_symbol_value
+        >= configured_limits.maximum_position_value * 0.8
+    ):
+        warnings.append(
+            "Projected symbol exposure is at least 80% "
+            "of the configured maximum position value."
+        )
+
+    if (
+        configured_limits
+        .maximum_portfolio_exposure_percent > 0
+        and projected_exposure_percent
+        >= configured_limits
+        .maximum_portfolio_exposure_percent
+        * 0.8
+    ):
+        warnings.append(
+            "Projected portfolio exposure is at least "
+            "80% of the configured maximum."
+        )
+
+    approved = not errors
+
+    if approved:
+        decision = RiskDecision.APPROVED
+        codes.append(
+            RiskCode.APPROVED
+        )
+    else:
+        decision = RiskDecision.REJECTED
+
+    return PortfolioRiskResult(
+        approved=approved,
+        decision=decision,
+        symbol=symbol,
+        action=action,
+        quantity=quantity,
+        entry_price=entry_price,
+        order_value=order_value,
+        projected_symbol_value=projected_symbol_value,
+        projected_portfolio_value=projected_portfolio_value,
+        projected_exposure_percent=(
+            projected_exposure_percent
+        ),
+        errors=tuple(errors),
+        warnings=tuple(warnings),
+        codes=tuple(codes),
+    )
