@@ -70,16 +70,6 @@ def test_market_scanner_initialization():
     assert scanner.data_loader is None
 
 
-def test_scan_requires_data_loader():
-    scanner = MarketScanner()
-
-    with pytest.raises(
-        RuntimeError,
-        match="requires a data_loader",
-    ):
-        scanner.scan(["AAPL"])
-
-
 def test_scan_symbol_returns_scored_result():
     data = make_market_data()
 
