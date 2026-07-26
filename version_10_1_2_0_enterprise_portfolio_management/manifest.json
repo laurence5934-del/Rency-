@@ -1,0 +1,7 @@
+{
+  "version": "10.1.2.0",
+  "name": "Enterprise Portfolio Management System",
+  "package": "app.portfolio",
+  "environment": "simulation-paper-ready",
+  "live_trading": false
+}

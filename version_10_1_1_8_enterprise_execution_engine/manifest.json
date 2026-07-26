@@ -1,0 +1,6 @@
+{
+  "version": "10.1.1.8",
+  "name": "Enterprise Execution Engine",
+  "mode": "SIMULATED",
+  "package": "app.ai.execution_engine"
+}
