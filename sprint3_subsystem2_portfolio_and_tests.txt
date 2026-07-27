@@ -1,0 +1,375 @@
+
+===== app\strategy\backtesting\portfolio_engine.py =====
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from types import MappingProxyType
+from typing import Mapping
+
+from .models import PortfolioSnapshot, Position, Trade
+
+
+ZERO = Decimal("0")
+
+
+class PortfolioError(RuntimeError):
+    """Base exception for portfolio-accounting failures."""
+
+
+class InsufficientBuyingPowerError(PortfolioError):
+    """Raised when a purchase exceeds available cash."""
+
+
+class InsufficientPositionError(PortfolioError):
+    """Raised when a sale exceeds the currently owned quantity."""
+
+
+class DuplicateTradeError(PortfolioError):
+    """Raised when the same trade is applied more than once."""
+
+
+class UnsupportedTradeSideError(PortfolioError):
+    """Raised when a trade contains an unsupported side."""
+
+
+@dataclass(slots=True)
+class _PositionState:
+    symbol: str
+    quantity: Decimal
+    average_price: Decimal
+    market_price: Decimal
+
+    def to_position(self) -> Position:
+        return Position(
+            symbol=self.symbol,
+            quantity=self.quantity,
+            average_price=self.average_price,
+            market_price=self.market_price,
+        )
+
+
+class PortfolioEngine:
+    """
+    Deterministic portfolio-accounting engine for long-only backtesting.
+
+    Accounting rules
+    ----------------
+    BUY:
+        cash -= quantity * execution_price + commission
+        average cost is updated using weighted-average execution prices
+
+    SELL:
+        cash += quantity * execution_price - commission
+        realized P&L += quantity * (execution_price - average_cost)
+        realized P&L -= commission
+
+    Equity:
+        cash + market value of all open positions
+    """
+
+    def __init__(self, initial_capital: Decimal) -> None:
+        if not isinstance(initial_capital, Decimal):
+            raise TypeError("initial_capital must be a Decimal")
+
+        if initial_capital < ZERO:
+            raise ValueError("initial_capital cannot be negative")
+
+        self._initial_capital = initial_capital
+        self._cash = initial_capital
+        self._realized_pnl = ZERO
+
+        self._positions: dict[str, _PositionState] = {}
+        self._processed_trade_ids: set[str] = set()
+
+        self._peak_equity = initial_capital
+        self._maximum_drawdown = ZERO
+
+    @property
+    def initial_capital(self) -> Decimal:
+        return self._initial_capital
+
+    @property
+    def cash(self) -> Decimal:
+        return self._cash
+
+    @property
+    def realized_pnl(self) -> Decimal:
+        return self._realized_pnl
+
+    @property
+    def positions(self) -> Mapping[str, Position]:
+        immutable_positions = {
+            symbol: state.to_position()
+            for symbol, state in sorted(self._positions.items())
+        }
+        return MappingProxyType(immutable_positions)
+
+    @property
+    def positions_value(self) -> Decimal:
+        return sum(
+            (
+                state.quantity * state.market_price
+                for state in self._positions.values()
+            ),
+            ZERO,
+        )
+
+    @property
+    def unrealized_pnl(self) -> Decimal:
+        return sum(
+            (
+                state.quantity
+                * (state.market_price - state.average_price)
+                for state in self._positions.values()
+            ),
+            ZERO,
+        )
+
+    @property
+    def equity(self) -> Decimal:
+        return self._cash + self.positions_value
+
+    @property
+    def peak_equity(self) -> Decimal:
+        return self._peak_equity
+
+    @property
+    def maximum_drawdown(self) -> Decimal:
+        return self._maximum_drawdown
+
+    def position_for(self, symbol: str) -> Position | None:
+        normalized_symbol = self._normalize_symbol(symbol)
+        state = self._positions.get(normalized_symbol)
+
+        if state is None:
+            return None
+
+        return state.to_position()
+
+    def apply_trade(self, trade: Trade) -> None:
+        """
+        Apply one completed trade to portfolio state.
+
+        The operation is deterministic and rejects duplicate trade IDs.
+        """
+
+        self._validate_trade(trade)
+
+        if trade.trade_id in self._processed_trade_ids:
+            raise DuplicateTradeError(
+                f"Trade has already been applied: {trade.trade_id}"
+            )
+
+        side = trade.side.strip().lower()
+
+        if side == "buy":
+            self._apply_buy(trade)
+        elif side == "sell":
+            self._apply_sell(trade)
+        else:
+            raise UnsupportedTradeSideError(
+                f"Unsupported trade side: {trade.side!r}"
+            )
+
+        self._processed_trade_ids.add(trade.trade_id)
+        self._update_drawdown_state()
+
+    def mark_to_market(
+        self,
+        symbol: str,
+        market_price: Decimal,
+    ) -> None:
+        """
+        Update the market price of an existing position.
+
+        Symbols without an open position are ignored because there is no
+        portfolio asset to value.
+        """
+
+        normalized_symbol = self._normalize_symbol(symbol)
+        self._validate_price(market_price, field_name="market_price")
+
+        state = self._positions.get(normalized_symbol)
+
+        if state is None:
+            return
+
+        state.market_price = market_price
+        self._update_drawdown_state()
+
+    def mark_all_to_market(
+        self,
+        prices: Mapping[str, Decimal],
+    ) -> None:
+        for symbol, price in prices.items():
+            self.mark_to_market(symbol, price)
+
+    def create_snapshot(
+        self,
+        timestamp: datetime,
+    ) -> PortfolioSnapshot:
+        if not isinstance(timestamp, datetime):
+            raise TypeError("timestamp must be a datetime")
+
+        self._update_drawdown_state()
+
+        return PortfolioSnapshot(
+            timestamp=timestamp,
+            cash=self.cash,
+            positions_value=self.positions_value,
+            equity=self.equity,
+            realized_pnl=self.realized_pnl,
+            unrealized_pnl=self.unrealized_pnl,
+            drawdown=self._current_drawdown(),
+        )
+
+    def _apply_buy(self, trade: Trade) -> None:
+        symbol = self._normalize_symbol(trade.symbol)
+        gross_cost = trade.quantity * trade.price
+        total_cost = gross_cost + trade.commission
+
+        if total_cost > self._cash:
+            raise InsufficientBuyingPowerError(
+                "Purchase exceeds available cash: "
+                f"required={total_cost}, available={self._cash}"
+            )
+
+        state = self._positions.get(symbol)
+
+        if state is None:
+            self._positions[symbol] = _PositionState(
+                symbol=symbol,
+                quantity=trade.quantity,
+                average_price=trade.price,
+                market_price=trade.price,
+            )
+        else:
+            previous_cost_basis = state.quantity * state.average_price
+            added_cost_basis = trade.quantity * trade.price
+            new_quantity = state.quantity + trade.quantity
+
+            state.quantity = new_quantity
+            state.average_price = (
+                previous_cost_basis + added_cost_basis
+            ) / new_quantity
+            state.market_price = trade.price
+
+        self._cash -= total_cost
+
+    def _apply_sell(self, trade: Trade) -> None:
+        symbol = self._normalize_symbol(trade.symbol)
+        state = self._positions.get(symbol)
+
+        if state is None:
+            raise InsufficientPositionError(
+                f"No open position exists for {symbol}"
+            )
+
+        if trade.quantity > state.quantity:
+            raise InsufficientPositionError(
+                "Sale exceeds owned quantity: "
+                f"requested={trade.quantity}, owned={state.quantity}"
+            )
+
+        gross_proceeds = trade.quantity * trade.price
+        net_proceeds = gross_proceeds - trade.commission
+
+        trade_realized_pnl = (
+            trade.quantity * (trade.price - state.average_price)
+        ) - trade.commission
+
+        self._cash += net_proceeds
+        self._realized_pnl += trade_realized_pnl
+
+        remaining_quantity = state.quantity - trade.quantity
+
+        if remaining_quantity == ZERO:
+            del self._positions[symbol]
+        else:
+            state.quantity = remaining_quantity
+            state.market_price = trade.price
+
+    def _update_drawdown_state(self) -> None:
+        current_equity = self.equity
+
+        if current_equity > self._peak_equity:
+            self._peak_equity = current_equity
+
+        current_drawdown = self._current_drawdown()
+
+        if current_drawdown > self._maximum_drawdown:
+            self._maximum_drawdown = current_drawdown
+
+    def _current_drawdown(self) -> Decimal:
+        if self._peak_equity <= ZERO:
+            return ZERO
+
+        drawdown = (
+            self._peak_equity - self.equity
+        ) / self._peak_equity
+
+        return max(drawdown, ZERO)
+
+    @staticmethod
+    def _normalize_symbol(symbol: str) -> str:
+        if not isinstance(symbol, str):
+            raise TypeError("symbol must be a string")
+
+        normalized = symbol.strip().upper()
+
+        if not normalized:
+            raise ValueError("symbol cannot be empty")
+
+        return normalized
+
+    @classmethod
+    def _validate_trade(cls, trade: Trade) -> None:
+        if not isinstance(trade, Trade):
+            raise TypeError("trade must be a Trade")
+
+        if not trade.trade_id.strip():
+            raise ValueError("trade_id cannot be empty")
+
+        cls._normalize_symbol(trade.symbol)
+
+        if trade.quantity <= ZERO:
+            raise ValueError("trade quantity must be greater than zero")
+
+        cls._validate_price(trade.price, field_name="trade.price")
+
+        if trade.commission < ZERO:
+            raise ValueError("trade commission cannot be negative")
+
+        if trade.slippage < ZERO:
+            raise ValueError("trade slippage cannot be negative")
+
+    @staticmethod
+    def _validate_price(
+        price: Decimal,
+        *,
+        field_name: str,
+    ) -> None:
+        if not isinstance(price, Decimal):
+            raise TypeError(f"{field_name} must be a Decimal")
+
+        if price <= ZERO:
+            raise ValueError(f"{field_name} must be greater than zero")
+
+===== tests\strategy\backtesting\test_portfolio_engine.py =====
+
+[FILE NOT FOUND]
+
+===== tests\strategy\backtesting\test_backtest_engine.py =====
+
+[FILE NOT FOUND]
+
+===== tests\strategy\backtesting\test_simulation_engine.py =====
+
+[FILE NOT FOUND]
+
+===== tests\strategy\backtesting\test_execution_simulator.py =====
+
+[FILE NOT FOUND]

@@ -1,0 +1,856 @@
+
+===== app\strategy\backtesting\models.py =====
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from decimal import Decimal
+from enum import Enum
+from types import MappingProxyType
+from typing import Any, Mapping, Sequence
+
+
+class BacktestStatus(str, Enum):
+    CREATED = "created"
+    VALIDATED = "validated"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class Timeframe(str, Enum):
+    MINUTE = "1m"
+    HOUR = "1h"
+    DAY = "1d"
+
+
+@dataclass(frozen=True, slots=True)
+class BacktestConfig:
+    strategy_id: str
+    strategy_version: str
+    dataset_id: str
+    initial_capital: Decimal
+    start_time: datetime
+    end_time: datetime
+    timeframe: Timeframe = Timeframe.DAY
+    base_currency: str = "USD"
+    random_seed: int = 0
+    parameters: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        normalized = dict(self.parameters)
+        object.__setattr__(self, "parameters", MappingProxyType(normalized))
+
+
+@dataclass(frozen=True, slots=True)
+class Trade:
+    trade_id: str
+    symbol: str
+    quantity: Decimal
+    price: Decimal
+    side: str
+    timestamp: datetime
+    commission: Decimal = Decimal("0")
+    slippage: Decimal = Decimal("0")
+
+
+@dataclass(frozen=True, slots=True)
+class Position:
+    symbol: str
+    quantity: Decimal
+    average_price: Decimal
+    market_price: Decimal
+
+    @property
+    def market_value(self) -> Decimal:
+        return self.quantity * self.market_price
+
+    @property
+    def unrealized_pnl(self) -> Decimal:
+        return self.quantity * (self.market_price - self.average_price)
+
+
+@dataclass(frozen=True, slots=True)
+class PortfolioSnapshot:
+    timestamp: datetime
+    cash: Decimal
+    positions_value: Decimal
+    equity: Decimal
+    realized_pnl: Decimal = Decimal("0")
+    unrealized_pnl: Decimal = Decimal("0")
+    drawdown: Decimal = Decimal("0")
+
+
+@dataclass(frozen=True, slots=True)
+class BacktestResult:
+    backtest_id: str
+    status: BacktestStatus
+    config: BacktestConfig
+    started_at: datetime
+    completed_at: datetime | None = None
+    trades: Sequence[Trade] = field(default_factory=tuple)
+    snapshots: Sequence[PortfolioSnapshot] = field(default_factory=tuple)
+    metrics: Mapping[str, Decimal | int | float | str] = field(default_factory=dict)
+    warnings: Sequence[str] = field(default_factory=tuple)
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "trades", tuple(self.trades))
+        object.__setattr__(self, "snapshots", tuple(self.snapshots))
+        object.__setattr__(self, "warnings", tuple(self.warnings))
+        object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+===== app\strategy\backtesting\backtest_engine.py =====
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import asdict
+from datetime import datetime, timezone
+from decimal import Decimal
+from threading import RLock
+from typing import Callable, Iterable
+
+from .audit_log import BacktestAuditLog
+from .metrics import BacktestMetrics
+from .models import BacktestConfig, BacktestResult, BacktestStatus
+from .execution_simulator import ExecutionSimulator, SimulatedOrder
+from .simulation_engine import HistoricalBar, MarketEvent, SimulationEngine
+from .models import (
+    BacktestConfig,
+    BacktestResult,
+    BacktestStatus,
+    Trade,
+)
+
+BacktestRunner = Callable[[str, BacktestConfig], BacktestResult]
+
+SimulationStrategy = Callable[
+    [MarketEvent],
+    Iterable[SimulatedOrder] | None,
+]
+
+class BacktestValidationError(ValueError):
+    pass
+
+
+class BacktestEngine:
+    """Lifecycle orchestrator for the Enterprise Backtesting Framework.
+
+    Sprint 1 deliberately owns configuration validation, immutable IDs, lifecycle,
+    metrics, and auditability. Market replay and execution arrive in later sprints.
+    """
+
+    def __init__(
+        self,
+        *,
+        audit_log: BacktestAuditLog | None = None,
+        metrics: BacktestMetrics | None = None,
+    ) -> None:
+        self.audit_log = audit_log or BacktestAuditLog()
+        self.metrics = metrics or BacktestMetrics()
+        self._results: dict[str, BacktestResult] = {}
+        self._lock = RLock()
+
+    def validate(self, config: BacktestConfig) -> None:
+        problems: list[str] = []
+        if not config.strategy_id.strip():
+            problems.append("strategy_id is required")
+        if not config.strategy_version.strip():
+            problems.append("strategy_version is required")
+        if not config.dataset_id.strip():
+            problems.append("dataset_id is required")
+        if config.initial_capital <= Decimal("0"):
+            problems.append("initial_capital must be greater than zero")
+        if config.start_time.tzinfo is None or config.end_time.tzinfo is None:
+            problems.append("start_time and end_time must be timezone-aware")
+        if config.start_time >= config.end_time:
+            problems.append("start_time must be earlier than end_time")
+        if len(config.base_currency.strip()) != 3:
+            problems.append("base_currency must be a three-letter code")
+        if problems:
+            raise BacktestValidationError("; ".join(problems))
+
+    def create_backtest_id(self, config: BacktestConfig) -> str:
+        payload = {
+            "strategy_id": config.strategy_id,
+            "strategy_version": config.strategy_version,
+            "dataset_id": config.dataset_id,
+            "initial_capital": str(config.initial_capital),
+            "start_time": config.start_time.isoformat(),
+            "end_time": config.end_time.isoformat(),
+            "timeframe": config.timeframe.value,
+            "base_currency": config.base_currency.upper(),
+            "random_seed": config.random_seed,
+            "parameters": dict(sorted(config.parameters.items())),
+        }
+        digest = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:16].upper()
+        return f"BT-{digest}"
+
+    def prepare(self, config: BacktestConfig) -> BacktestResult:
+        self.validate(config)
+        backtest_id = self.create_backtest_id(config)
+        result = BacktestResult(
+            backtest_id=backtest_id,
+            status=BacktestStatus.VALIDATED,
+            config=config,
+            started_at=datetime.now(timezone.utc),
+        )
+        with self._lock:
+            self._results[backtest_id] = result
+        self.metrics.increment_created()
+        self.metrics.increment_validated()
+        self.audit_log.record(backtest_id, "BACKTEST_VALIDATED", strategy_id=config.strategy_id)
+        return result
+
+    def run(self, config: BacktestConfig, runner: BacktestRunner | None = None) -> BacktestResult:
+        prepared = self.prepare(config)
+        self.audit_log.record(prepared.backtest_id, "BACKTEST_STARTED")
+        try:
+            with self.metrics.measure_runtime():
+                if runner is None:
+                    final = BacktestResult(
+                        backtest_id=prepared.backtest_id,
+                        status=BacktestStatus.COMPLETED,
+                        config=config,
+                        started_at=prepared.started_at,
+                        completed_at=datetime.now(timezone.utc),
+                        warnings=("Sprint 1 foundation run: simulation pipeline is not installed yet.",),
+                    )
+                else:
+                    final = runner(prepared.backtest_id, config)
+                    if final.backtest_id != prepared.backtest_id:
+                        raise ValueError("runner returned a mismatched backtest_id")
+                    if final.config != config:
+                        raise ValueError("runner returned a mismatched configuration")
+            with self._lock:
+                self._results[final.backtest_id] = final
+            if final.status is BacktestStatus.FAILED:
+                self.metrics.increment_failed()
+                self.audit_log.record(final.backtest_id, "BACKTEST_FAILED", error=final.error)
+            else:
+                self.metrics.increment_completed()
+                self.audit_log.record(final.backtest_id, "BACKTEST_COMPLETED")
+            return final
+        except Exception as exc:
+            failed = BacktestResult(
+                backtest_id=prepared.backtest_id,
+                status=BacktestStatus.FAILED,
+                config=config,
+                started_at=prepared.started_at,
+                completed_at=datetime.now(timezone.utc),
+                error=str(exc),
+            )
+            with self._lock:
+                self._results[failed.backtest_id] = failed
+            self.metrics.increment_failed()
+            self.audit_log.record(failed.backtest_id, "BACKTEST_FAILED", error=str(exc))
+            return failed
+
+    def get_result(self, backtest_id: str) -> BacktestResult | None:
+        with self._lock:
+            return self._results.get(backtest_id)
+
+    def list_results(self) -> tuple[BacktestResult, ...]:
+        with self._lock:
+            return tuple(self._results[key] for key in sorted(self._results))
+    def run_simulation(
+        self,
+        config: BacktestConfig,
+        *,
+        bars: Iterable[HistoricalBar],
+        strategy: SimulationStrategy,
+        execution_simulator: ExecutionSimulator | None = None,
+    ) -> BacktestResult:
+        """Run a deterministic historical market simulation.
+
+        Each historical bar is released chronologically to the supplied strategy.
+        Orders returned by the strategy are executed against the bar's closing
+        price through the configured execution simulator.
+        """
+
+        if not callable(strategy):
+            raise BacktestValidationError("strategy must be callable")
+
+        historical_bars = tuple(bars)
+
+        def simulation_runner(
+            backtest_id: str,
+            runner_config: BacktestConfig,
+        ) -> BacktestResult:
+            simulator = execution_simulator or ExecutionSimulator()
+
+            # Bind the shared lifecycle infrastructure to the simulator supplied
+            # by the caller.
+            simulator.audit_log = self.audit_log
+            simulator.backtest_id = backtest_id
+            simulator.reset()
+
+            trades: list = []
+
+            replay = SimulationEngine(
+                historical_bars,
+                audit_log=self.audit_log,
+                backtest_id=backtest_id,
+            )
+
+            def handle_market_event(event: MarketEvent) -> None:
+                generated_orders = strategy(event)
+
+                if generated_orders is None:
+                    return
+
+                for order in generated_orders:
+                    if not isinstance(order, SimulatedOrder):
+                        raise TypeError(
+                            "strategy must return SimulatedOrder instances"
+                        )
+
+                    if order.symbol.upper() != event.bar.symbol.upper():
+                        raise ValueError(
+                            "order symbol must match the active historical bar"
+                        )
+
+                    execution_report = simulator.execute(
+                        order,
+                        market_price=event.bar.close,
+                        executed_at=event.timestamp,
+                    )
+                    trades.append(execution_report.to_trade())
+
+            replay.subscribe(handle_market_event)
+            replay.run()
+
+            return BacktestResult(
+    backtest_id=backtest_id,
+    status=BacktestStatus.COMPLETED,
+    config=runner_config,
+    started_at=datetime.now(timezone.utc),
+    completed_at=datetime.now(timezone.utc),
+    trades=tuple(trades),
+    metrics={
+        "bars_processed": replay.total_bars,
+        "orders_executed": len(trades),
+    },
+)
+
+        return self.run(config, runner=simulation_runner)
+
+===== app\strategy\backtesting\simulation_engine.py =====
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from enum import Enum
+from threading import RLock
+from typing import Callable, Iterable, Iterator, Sequence
+
+from .audit_log import BacktestAuditLog
+
+
+ZERO = Decimal("0")
+
+
+class SimulationError(ValueError):
+    """Raised when historical replay cannot proceed safely."""
+
+
+class MarketEventType(str, Enum):
+    MARKET_OPEN = "market_open"
+    BAR = "bar"
+    MARKET_CLOSE = "market_close"
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalBar:
+    symbol: str
+    timestamp: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal = ZERO
+
+    def __post_init__(self) -> None:
+        if not self.symbol.strip():
+            raise SimulationError("historical bar symbol is required")
+        if self.timestamp.tzinfo is None:
+            raise SimulationError("historical bar timestamp must be timezone-aware")
+        if min(self.open, self.high, self.low, self.close) <= ZERO:
+            raise SimulationError("OHLC prices must be greater than zero")
+        if self.high < max(self.open, self.close, self.low):
+            raise SimulationError("high price is inconsistent with OHLC values")
+        if self.low > min(self.open, self.close, self.high):
+            raise SimulationError("low price is inconsistent with OHLC values")
+        if self.volume < ZERO:
+            raise SimulationError("volume cannot be negative")
+
+
+@dataclass(frozen=True, slots=True)
+class MarketEvent:
+    sequence: int
+    event_type: MarketEventType
+    timestamp: datetime
+    bar: HistoricalBar
+
+
+MarketEventHandler = Callable[[MarketEvent], None]
+
+
+class SimulationEngine:
+    """Chronological, no-look-ahead replay engine for historical bars."""
+
+    def __init__(
+        self,
+        bars: Iterable[HistoricalBar] = (),
+        *,
+        audit_log: BacktestAuditLog | None = None,
+        backtest_id: str = "UNASSIGNED",
+    ) -> None:
+        self.audit_log = audit_log
+        self.backtest_id = backtest_id
+        self._bars: tuple[HistoricalBar, ...] = ()
+        self._index = 0
+        self._subscribers: list[MarketEventHandler] = []
+        self._lock = RLock()
+        self.load_history(bars)
+
+    def load_history(self, bars: Iterable[HistoricalBar]) -> None:
+        normalized = tuple(bars)
+        self._validate_history(normalized)
+        with self._lock:
+            self._bars = normalized
+            self._index = 0
+        if self.audit_log is not None:
+            self.audit_log.record(
+                self.backtest_id,
+                "SIMULATION_HISTORY_LOADED",
+                bar_count=len(normalized),
+            )
+
+    def subscribe(self, handler: MarketEventHandler) -> None:
+        if not callable(handler):
+            raise SimulationError("simulation subscriber must be callable")
+        with self._lock:
+            if handler not in self._subscribers:
+                self._subscribers.append(handler)
+
+    def unsubscribe(self, handler: MarketEventHandler) -> None:
+        with self._lock:
+            if handler in self._subscribers:
+                self._subscribers.remove(handler)
+
+    @property
+    def current_bar(self) -> HistoricalBar | None:
+        with self._lock:
+            if self._index == 0 or not self._bars:
+                return None
+            return self._bars[self._index - 1]
+
+    @property
+    def current_index(self) -> int:
+        with self._lock:
+            return self._index
+
+    @property
+    def total_bars(self) -> int:
+        with self._lock:
+            return len(self._bars)
+
+    def visible_history(self) -> tuple[HistoricalBar, ...]:
+        """Return only bars already released by the simulation clock."""
+        with self._lock:
+            return self._bars[: self._index]
+
+    def is_finished(self) -> bool:
+        with self._lock:
+            return self._index >= len(self._bars)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._index = 0
+        if self.audit_log is not None:
+            self.audit_log.record(self.backtest_id, "SIMULATION_RESET")
+
+    def next_event(self) -> MarketEvent | None:
+        with self._lock:
+            if self._index >= len(self._bars):
+                return None
+            bar = self._bars[self._index]
+            self._index += 1
+            event = MarketEvent(
+                sequence=self._index,
+                event_type=MarketEventType.BAR,
+                timestamp=bar.timestamp,
+                bar=bar,
+            )
+            subscribers = tuple(self._subscribers)
+
+        for subscriber in subscribers:
+            subscriber(event)
+        if self.audit_log is not None:
+            self.audit_log.record(
+                self.backtest_id,
+                "MARKET_BAR_RELEASED",
+                sequence=event.sequence,
+                symbol=bar.symbol,
+                timestamp=bar.timestamp.isoformat(),
+            )
+        return event
+
+    def run(self) -> tuple[MarketEvent, ...]:
+        events: list[MarketEvent] = []
+        while True:
+            event = self.next_event()
+            if event is None:
+                break
+            events.append(event)
+        if self.audit_log is not None:
+            self.audit_log.record(
+                self.backtest_id,
+                "SIMULATION_COMPLETED",
+                event_count=len(events),
+            )
+        return tuple(events)
+
+    def __iter__(self) -> Iterator[MarketEvent]:
+        while True:
+            event = self.next_event()
+            if event is None:
+                return
+            yield event
+
+    @staticmethod
+    def _validate_history(bars: Sequence[HistoricalBar]) -> None:
+        previous_key: tuple[datetime, str] | None = None
+        for bar in bars:
+            key = (bar.timestamp, bar.symbol.upper())
+            if previous_key is not None and key < previous_key:
+                raise SimulationError("historical bars must be sorted by timestamp and symbol")
+            previous_key = key
+
+===== app\strategy\backtesting\execution_simulator.py =====
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from enum import Enum
+from threading import RLock
+from typing import Mapping
+
+from .audit_log import BacktestAuditLog
+from .commission_model import CommissionModel, NoCommission
+from .models import Trade
+from .slippage_model import NoSlippage, OrderSide, SlippageModel
+
+
+ZERO = Decimal("0")
+
+
+class ExecutionError(ValueError):
+    """Raised when a simulated order cannot be executed safely."""
+
+
+class OrderType(str, Enum):
+    MARKET = "market"
+
+
+@dataclass(frozen=True, slots=True)
+class SimulatedOrder:
+    order_id: str
+    symbol: str
+    quantity: Decimal
+    side: OrderSide
+    submitted_at: datetime
+    order_type: OrderType = OrderType.MARKET
+    metadata: Mapping[str, str] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionReport:
+    execution_id: str
+    order_id: str
+    symbol: str
+    side: OrderSide
+    quantity: Decimal
+    reference_price: Decimal
+    fill_price: Decimal
+    commission: Decimal
+    slippage_per_unit: Decimal
+    slippage_cost: Decimal
+    gross_notional: Decimal
+    net_cash_effect: Decimal
+    executed_at: datetime
+    execution_quality: Decimal
+
+    def to_trade(self) -> Trade:
+        return Trade(
+            trade_id=self.execution_id,
+            symbol=self.symbol,
+            quantity=self.quantity,
+            price=self.fill_price,
+            side=self.side.value,
+            timestamp=self.executed_at,
+            commission=self.commission,
+            slippage=self.slippage_cost,
+        )
+
+
+class ExecutionSimulator:
+    """Deterministic, broker-free market-order execution simulator."""
+
+    def __init__(
+        self,
+        *,
+        commission_model: CommissionModel | None = None,
+        slippage_model: SlippageModel | None = None,
+        audit_log: BacktestAuditLog | None = None,
+        backtest_id: str = "UNASSIGNED",
+    ) -> None:
+        self.commission_model = commission_model or NoCommission()
+        self.slippage_model = slippage_model or NoSlippage()
+        self.audit_log = audit_log
+        self.backtest_id = backtest_id
+        self._reports: list[ExecutionReport] = []
+        self._executed_order_ids: set[str] = set()
+        self._lock = RLock()
+
+    def execute(
+        self,
+        order: SimulatedOrder,
+        *,
+        market_price: Decimal,
+        executed_at: datetime,
+    ) -> ExecutionReport:
+        self._validate(order=order, market_price=market_price, executed_at=executed_at)
+        with self._lock:
+            if order.order_id in self._executed_order_ids:
+                raise ExecutionError(f"order_id already executed: {order.order_id}")
+
+            fill_price = self.slippage_model.apply(reference_price=market_price, side=order.side)
+            commission = self.commission_model.calculate(quantity=order.quantity, price=fill_price)
+            slippage_per_unit = abs(fill_price - market_price)
+            slippage_cost = slippage_per_unit * order.quantity
+            gross_notional = fill_price * order.quantity
+            net_cash_effect = (
+                -(gross_notional + commission)
+                if order.side is OrderSide.BUY
+                else gross_notional - commission
+            )
+            total_execution_cost = commission + slippage_cost
+            reference_notional = market_price * order.quantity
+            execution_quality = _execution_quality(
+                total_execution_cost=total_execution_cost,
+                reference_notional=reference_notional,
+            )
+            execution_id = _execution_id(
+                order_id=order.order_id,
+                symbol=order.symbol,
+                side=order.side,
+                quantity=order.quantity,
+                fill_price=fill_price,
+                executed_at=executed_at,
+            )
+            report = ExecutionReport(
+                execution_id=execution_id,
+                order_id=order.order_id,
+                symbol=order.symbol,
+                side=order.side,
+                quantity=order.quantity,
+                reference_price=market_price,
+                fill_price=fill_price,
+                commission=commission,
+                slippage_per_unit=slippage_per_unit,
+                slippage_cost=slippage_cost,
+                gross_notional=gross_notional,
+                net_cash_effect=net_cash_effect,
+                executed_at=executed_at,
+                execution_quality=execution_quality,
+            )
+            self._reports.append(report)
+            self._executed_order_ids.add(order.order_id)
+
+        if self.audit_log is not None:
+            self.audit_log.record(
+                self.backtest_id,
+                "ORDER_EXECUTED",
+                order_id=order.order_id,
+                execution_id=report.execution_id,
+                symbol=order.symbol,
+                side=order.side.value,
+                quantity=str(order.quantity),
+                reference_price=str(market_price),
+                fill_price=str(fill_price),
+                commission=str(commission),
+                slippage_cost=str(slippage_cost),
+            )
+        return report
+
+    def reports(self) -> tuple[ExecutionReport, ...]:
+        with self._lock:
+            return tuple(self._reports)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._reports.clear()
+            self._executed_order_ids.clear()
+
+    @staticmethod
+    def _validate(
+        *,
+        order: SimulatedOrder,
+        market_price: Decimal,
+        executed_at: datetime,
+    ) -> None:
+        if not order.order_id.strip():
+            raise ExecutionError("order_id is required")
+        if not order.symbol.strip():
+            raise ExecutionError("symbol is required")
+        if order.quantity <= ZERO:
+            raise ExecutionError("quantity must be greater than zero")
+        if market_price <= ZERO:
+            raise ExecutionError("market_price must be greater than zero")
+        if order.submitted_at.tzinfo is None or executed_at.tzinfo is None:
+            raise ExecutionError("submitted_at and executed_at must be timezone-aware")
+        if executed_at < order.submitted_at:
+            raise ExecutionError("executed_at cannot be earlier than submitted_at")
+        if order.order_type is not OrderType.MARKET:
+            raise ExecutionError(f"unsupported order type: {order.order_type}")
+
+
+def _execution_id(
+    *,
+    order_id: str,
+    symbol: str,
+    side: OrderSide,
+    quantity: Decimal,
+    fill_price: Decimal,
+    executed_at: datetime,
+) -> str:
+    payload = "|".join(
+        (
+            order_id,
+            symbol.upper(),
+            side.value,
+            str(quantity),
+            str(fill_price),
+            executed_at.isoformat(),
+        )
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16].upper()
+    return f"EX-{digest}"
+
+
+def _execution_quality(*, total_execution_cost: Decimal, reference_notional: Decimal) -> Decimal:
+    if reference_notional <= ZERO:
+        return ZERO
+    quality = Decimal("100") * (Decimal("1") - (total_execution_cost / reference_notional))
+    return max(ZERO, min(Decimal("100"), quality))
+
+===== app\strategy\backtesting\__init__.py =====
+
+"""AITradingOS Enterprise Backtesting Framework, Version 10.1.3.2 Sprint 2."""
+
+from .audit_log import AuditEvent, BacktestAuditLog
+from .backtest_engine import BacktestEngine, BacktestValidationError
+from .commission_model import (
+    CommissionModel,
+    CommissionModelError,
+    FlatCommission,
+    NoCommission,
+    PercentageCommission,
+    PerShareCommission,
+)
+from .execution_simulator import (
+    ExecutionError,
+    ExecutionReport,
+    ExecutionSimulator,
+    SimulatedOrder,
+)
+
+from .metrics import BacktestMetrics, BacktestMetricsSnapshot
+from .models import (
+    BacktestConfig,
+    BacktestResult,
+    BacktestStatus,
+    PortfolioSnapshot,
+    Position,
+    Timeframe,
+    Trade,
+)
+from .simulation_engine import (
+    HistoricalBar,
+    MarketEvent,
+    SimulationEngine,
+    SimulationError,
+)
+from .slippage_model import (
+    FixedSlippage,
+    NoSlippage,
+    OrderSide,
+    PercentageSlippage,
+    SlippageModel,
+    SlippageModelError,
+)
+from .portfolio_engine import (
+    DuplicateTradeError,
+    InsufficientBuyingPowerError,
+    InsufficientPositionError,
+    PortfolioEngine,
+    PortfolioError,
+    UnsupportedTradeSideError,
+)
+
+__all__ = [
+    "AuditEvent",
+    "BacktestAuditLog",
+    "BacktestConfig",
+    "BacktestEngine",
+    "BacktestMetrics",
+    "BacktestMetricsSnapshot",
+    "BacktestResult",
+    "BacktestStatus",
+    "BacktestValidationError",
+    "CommissionModel",
+    "CommissionModelError",
+    "ExecutionError",
+    "ExecutionSimulator",
+    "FixedSlippage",
+    "FlatCommission",
+    "HistoricalBar",
+    "MarketEvent",
+    "NoCommission",
+    "NoSlippage",
+    "OrderSide",
+    "PercentageCommission",
+    "PercentageSlippage",
+    "PerShareCommission",
+    "PortfolioSnapshot",
+    "Position",
+    "SimulationEngine",
+    "SimulationError",
+    "SlippageModel",
+    "SlippageModelError",
+    "Timeframe",
+    "Trade",
+    "DuplicateTradeError",
+    "InsufficientBuyingPowerError",
+    "InsufficientPositionError",
+    "PortfolioEngine",
+    "PortfolioError",
+    "UnsupportedTradeSideError",
+]
