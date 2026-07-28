@@ -129,3 +129,25 @@ def test_drawdown_duration() -> None:
     metrics = RiskAnalyzer().analyze(result)
 
     assert metrics.drawdown_duration == 3
+
+def test_default_volatility_is_zero() -> None:
+    metrics = RiskAnalyzer().analyze(
+        BacktestResult(
+            backtest_id="volatility-default",
+            status=BacktestStatus.COMPLETED,
+            config=BacktestConfig(
+                strategy_id="vol-test",
+                strategy_version="1.0.0",
+                dataset_id="vol-data",
+                initial_capital=Decimal("100000"),
+                start_time=datetime(2025, 1, 1),
+                end_time=datetime(2025, 1, 1),
+                timeframe=Timeframe.DAY,
+            ),
+            started_at=datetime(2025, 1, 1),
+            completed_at=datetime(2025, 1, 1),
+            snapshots=(),
+        )
+    )
+
+    assert metrics.volatility == Decimal("0")

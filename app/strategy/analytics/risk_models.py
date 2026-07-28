@@ -6,3 +6,4 @@ from decimal import Decimal
 class RiskMetrics:
     max_drawdown: Decimal
     drawdown_duration: int = 0
+    volatility: Decimal = Decimal("0")
