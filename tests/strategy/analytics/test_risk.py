@@ -151,3 +151,56 @@ def test_default_volatility_is_zero() -> None:
     )
 
     assert metrics.volatility == Decimal("0")
+
+def test_volatility_calculation() -> None:
+    start = datetime(2025, 1, 1)
+
+    config = BacktestConfig(
+        strategy_id="volatility-test",
+        strategy_version="1.0.0",
+        dataset_id="volatility-data",
+        initial_capital=Decimal("100"),
+        start_time=start,
+        end_time=datetime(2025, 1, 4),
+        timeframe=Timeframe.DAY,
+    )
+
+    snapshots = (
+        PortfolioSnapshot(
+            timestamp=datetime(2025, 1, 1),
+            cash=Decimal("100"),
+            positions_value=Decimal("0"),
+            equity=Decimal("100"),
+        ),
+        PortfolioSnapshot(
+            timestamp=datetime(2025, 1, 2),
+            cash=Decimal("110"),
+            positions_value=Decimal("0"),
+            equity=Decimal("110"),
+        ),
+        PortfolioSnapshot(
+            timestamp=datetime(2025, 1, 3),
+            cash=Decimal("99"),
+            positions_value=Decimal("0"),
+            equity=Decimal("99"),
+        ),
+        PortfolioSnapshot(
+            timestamp=datetime(2025, 1, 4),
+            cash=Decimal("108.9"),
+            positions_value=Decimal("0"),
+            equity=Decimal("108.9"),
+        ),
+    )
+
+    result = BacktestResult(
+        backtest_id="volatility-test-001",
+        status=BacktestStatus.COMPLETED,
+        config=config,
+        started_at=start,
+        completed_at=datetime(2025, 1, 4),
+        snapshots=snapshots,
+    )
+
+    metrics = RiskAnalyzer().analyze(result)
+
+    assert abs(metrics.volatility - Decimal("0.11547005383792515")) < Decimal("0.000000000000001")
