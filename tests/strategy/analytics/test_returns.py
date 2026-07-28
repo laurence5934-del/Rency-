@@ -197,4 +197,37 @@ def test_snapshots_are_sorted_before_analysis() -> None:
     metrics = ReturnAnalyzer().analyze(result)
 
     assert metrics.net_profit == Decimal("10000")
-    assert metrics.final_equity == Decimal("110000")    
+    assert metrics.final_equity == Decimal("110000") 
+
+def test_empty_snapshots_use_initial_capital() -> None:
+    start = datetime(2025, 1, 1)
+    end = datetime(2025, 1, 2)
+
+    config = BacktestConfig(
+        strategy_id="unit-test-strategy",
+        strategy_version="1.0.0",
+        dataset_id="unit-test-dataset",
+        initial_capital=Decimal("100000"),
+        start_time=start,
+        end_time=end,
+        timeframe=Timeframe.DAY,
+    )
+
+    result = BacktestResult(
+        backtest_id="empty-snapshots-test-001",
+        status=BacktestStatus.COMPLETED,
+        config=config,
+        started_at=start,
+        completed_at=end,
+        snapshots=(),
+    )
+
+    metrics = ReturnAnalyzer().analyze(result)
+
+    assert metrics.initial_capital == Decimal("100000")
+    assert metrics.final_equity == Decimal("100000")
+    assert metrics.net_profit == Decimal("0")
+    assert metrics.total_return == Decimal("0")
+    assert metrics.cagr == Decimal("0")
+    assert metrics.periodic_returns == ()
+    assert metrics.warnings   
