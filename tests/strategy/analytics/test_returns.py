@@ -8,6 +8,7 @@ from app.strategy.backtesting.models import (
     BacktestConfig,
     BacktestResult,
     BacktestStatus,
+    PortfolioSnapshot,
     Timeframe,
 )
 
