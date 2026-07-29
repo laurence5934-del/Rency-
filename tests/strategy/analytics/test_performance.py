@@ -1,6 +1,7 @@
 from decimal import Decimal
 from datetime import datetime
 
+from app.strategy.analytics.performance_models import PerformanceMetrics
 from app.strategy.analytics.performance import PerformanceAnalyzer
 from app.strategy.backtesting.models import (
     BacktestConfig,
@@ -169,3 +170,76 @@ def test_default_sortino_ratio_is_zero() -> None:
     metrics = PerformanceAnalyzer().analyze(result)
 
     assert metrics.sortino_ratio == Decimal("0")
+
+def test_positive_sortino_ratio() -> None:
+    from app.strategy.backtesting.models import PortfolioSnapshot
+
+    start = datetime(2025, 1, 1)
+
+    config = BacktestConfig(
+        strategy_id="sortino-test",
+        strategy_version="1.0.0",
+        dataset_id="dataset",
+        initial_capital=Decimal("100"),
+        start_time=start,
+        end_time=datetime(2025, 1, 5),
+        timeframe=Timeframe.DAY,
+    )
+
+    snapshots = (
+        PortfolioSnapshot(
+            timestamp=datetime(2025, 1, 1),
+            cash=Decimal("100"),
+            positions_value=Decimal("0"),
+            equity=Decimal("100"),
+        ),
+        PortfolioSnapshot(
+            timestamp=datetime(2025, 1, 2),
+            cash=Decimal("110"),
+            positions_value=Decimal("0"),
+            equity=Decimal("110"),
+        ),
+        PortfolioSnapshot(
+            timestamp=datetime(2025, 1, 3),
+            cash=Decimal("104.5"),
+            positions_value=Decimal("0"),
+            equity=Decimal("104.5"),
+        ),
+        PortfolioSnapshot(
+            timestamp=datetime(2025, 1, 4),
+            cash=Decimal("114.95"),
+            positions_value=Decimal("0"),
+            equity=Decimal("114.95"),
+        ),
+        PortfolioSnapshot(
+            timestamp=datetime(2025, 1, 5),
+            cash=Decimal("103.455"),
+            positions_value=Decimal("0"),
+            equity=Decimal("103.455"),
+        ),
+    )
+
+    result = BacktestResult(
+        backtest_id="sortino-001",
+        status=BacktestStatus.COMPLETED,
+        config=config,
+        started_at=start,
+        completed_at=datetime(2025, 1, 5),
+        snapshots=snapshots,
+    )
+
+    metrics = PerformanceAnalyzer().analyze(result)
+
+    assert metrics.sortino_ratio > Decimal("0")
+
+def test_default_calmar_ratio_is_zero() -> None:
+    metrics = PerformanceMetrics()
+    
+    assert metrics.calmar_ratio == Decimal("0")
+
+def test_positive_calmar_ratio() -> None:
+    metrics = PerformanceMetrics(
+        calmar_ratio=Decimal("1.25")
+    )
+
+    assert metrics.calmar_ratio > Decimal("0")

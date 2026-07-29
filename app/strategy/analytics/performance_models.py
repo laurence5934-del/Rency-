@@ -6,3 +6,4 @@ from decimal import Decimal
 class PerformanceMetrics:
     sharpe_ratio: Decimal = Decimal("0")
     sortino_ratio: Decimal = Decimal("0")
+    calmar_ratio: Decimal = Decimal("0")
