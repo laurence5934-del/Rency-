@@ -143,3 +143,29 @@ def test_sharpe_ratio_matches_expected_value() -> None:
     tolerance = Decimal("0.0000000000000000000000000001")
 
     assert abs(metrics.sharpe_ratio - expected) <= tolerance
+
+def test_default_sortino_ratio_is_zero() -> None:
+    start = datetime(2025, 1, 1)
+
+    config = BacktestConfig(
+        strategy_id="sortino-scaffold-test",
+        strategy_version="1.0.0",
+        dataset_id="dataset",
+        initial_capital=Decimal("100"),
+        start_time=start,
+        end_time=start,
+        timeframe=Timeframe.DAY,
+    )
+
+    result = BacktestResult(
+        backtest_id="sortino-scaffold-001",
+        status=BacktestStatus.COMPLETED,
+        config=config,
+        started_at=start,
+        completed_at=start,
+        snapshots=(),
+    )
+
+    metrics = PerformanceAnalyzer().analyze(result)
+
+    assert metrics.sortino_ratio == Decimal("0")
