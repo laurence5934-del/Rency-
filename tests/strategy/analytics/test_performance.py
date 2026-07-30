@@ -243,3 +243,146 @@ def test_positive_calmar_ratio() -> None:
     )
 
     assert metrics.calmar_ratio > Decimal("0")
+
+def test_default_profit_factor_is_zero() -> None:
+    metrics = PerformanceMetrics()
+
+    assert metrics.profit_factor == Decimal("0")
+
+def test_positive_profit_factor() -> None:
+    from app.strategy.backtesting.models import PortfolioSnapshot
+
+    start = datetime(2025, 1, 1)
+
+    config = BacktestConfig(
+        strategy_id="profit-factor-test",
+        strategy_version="1.0.0",
+        dataset_id="dataset",
+        initial_capital=Decimal("100"),
+        start_time=start,
+        end_time=datetime(2025, 1, 4),
+        timeframe=Timeframe.DAY,
+    )
+
+    snapshots = (
+        PortfolioSnapshot(
+            timestamp=datetime(2025, 1, 1),
+            cash=Decimal("100"),
+            positions_value=Decimal("0"),
+            equity=Decimal("100"),
+            realized_pnl=Decimal("0"),
+        ),
+        PortfolioSnapshot(
+            timestamp=datetime(2025, 1, 2),
+            cash=Decimal("200"),
+            positions_value=Decimal("0"),
+            equity=Decimal("200"),
+            realized_pnl=Decimal("100"),
+        ),
+        PortfolioSnapshot(
+            timestamp=datetime(2025, 1, 3),
+            cash=Decimal("160"),
+            positions_value=Decimal("0"),
+            equity=Decimal("160"),
+            realized_pnl=Decimal("60"),
+        ),
+        PortfolioSnapshot(
+            timestamp=datetime(2025, 1, 4),
+            cash=Decimal("240"),
+            positions_value=Decimal("0"),
+            equity=Decimal("240"),
+            realized_pnl=Decimal("140"),
+        ),
+    )
+
+    result = BacktestResult(
+        backtest_id="profit-factor-001",
+        status=BacktestStatus.COMPLETED,
+        config=config,
+        started_at=start,
+        completed_at=datetime(2025, 1, 4),
+        snapshots=snapshots,
+    )
+
+    metrics = PerformanceAnalyzer().analyze(result)
+
+    assert metrics.profit_factor == Decimal("4.5")
+
+def test_default_win_rate_is_zero() -> None:
+    metrics = PerformanceMetrics()
+
+    assert metrics.win_rate == Decimal("0")
+
+
+def test_win_rate_is_one_hundred_for_all_winners() -> None:
+    pnl_changes = [
+        Decimal("25"),
+        Decimal("50"),
+        Decimal("10"),
+    ]
+
+    win_rate = PerformanceAnalyzer._calculate_win_rate(
+        pnl_changes
+    )
+
+    assert win_rate == Decimal("100")
+
+
+def test_win_rate_is_zero_for_all_losers() -> None:
+    pnl_changes = [
+        Decimal("-25"),
+        Decimal("-50"),
+        Decimal("-10"),
+    ]
+
+    win_rate = PerformanceAnalyzer._calculate_win_rate(
+        pnl_changes
+    )
+
+    assert win_rate == Decimal("0")
+
+
+def test_win_rate_matches_mixed_results() -> None:
+    pnl_changes = [
+        Decimal("100"),
+        Decimal("-40"),
+        Decimal("80"),
+    ]
+
+    win_rate = PerformanceAnalyzer._calculate_win_rate(
+        pnl_changes
+    )
+
+    expected = Decimal(
+        "66.66666666666666666666666667"
+    )
+
+    assert win_rate == expected
+
+
+def test_win_rate_excludes_breakeven_results() -> None:
+    pnl_changes = [
+        Decimal("100"),
+        Decimal("0"),
+        Decimal("-50"),
+        Decimal("0"),
+    ]
+
+    win_rate = PerformanceAnalyzer._calculate_win_rate(
+        pnl_changes
+    )
+
+    assert win_rate == Decimal("50")
+
+
+def test_win_rate_is_zero_without_closed_results() -> None:
+    pnl_changes = [
+        Decimal("0"),
+        Decimal("0"),
+    ]
+
+    win_rate = PerformanceAnalyzer._calculate_win_rate(
+        pnl_changes
+    )
+
+    assert win_rate == Decimal("0")

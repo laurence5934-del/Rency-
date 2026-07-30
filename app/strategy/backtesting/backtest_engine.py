@@ -143,9 +143,9 @@ class BacktestEngine:
             )
             with self._lock:
                 self._results[failed.backtest_id] = failed
-            self.metrics.increment_failed()
-            self.audit_log.record(failed.backtest_id, "BACKTEST_FAILED", error=str(exc))
-            return failed
+                self.metrics.increment_failed()
+                self.audit_log.record(failed.backtest_id, "BACKTEST_FAILED", error=str(exc))
+                return failed
 
     def get_result(self, backtest_id: str) -> BacktestResult | None:
         with self._lock:
@@ -154,7 +154,8 @@ class BacktestEngine:
     def list_results(self) -> tuple[BacktestResult, ...]:
         with self._lock:
             return tuple(self._results[key] for key in sorted(self._results))
-        def run_simulation(
+
+    def run_simulation(
         self,
         config: BacktestConfig,
         *,
@@ -162,117 +163,113 @@ class BacktestEngine:
         strategy: SimulationStrategy,
         execution_simulator: ExecutionSimulator | None = None,
     ) -> BacktestResult:
-            """Run a deterministic historical market simulation.
+        """Run a deterministic historical market simulation.
 
-        Historical bars are released chronologically to the strategy. Generated
-        orders are executed against each bar's closing price, applied to the
-        portfolio, marked to market, and captured in one portfolio snapshot per
-        processed bar.
+        Historical bars are released chronologically to the strategy.
         """
 
         if not callable(strategy):
             raise BacktestValidationError("strategy must be callable")
-
         historical_bars = tuple(bars)
 
         def simulation_runner(
-            backtest_id: str,
-            runner_config: BacktestConfig,
-        ) -> BacktestResult:
-            started_at = datetime.now(timezone.utc)
+                backtest_id: str,
+                runner_config: BacktestConfig,
+            ) -> BacktestResult:
+                started_at = datetime.now(timezone.utc)
 
-            simulator = execution_simulator or ExecutionSimulator()
+                simulator = execution_simulator or ExecutionSimulator()
 
-            # Bind the shared lifecycle infrastructure to either the default
-            # simulator or a simulator supplied by the caller.
-            simulator.audit_log = self.audit_log
-            simulator.backtest_id = backtest_id
-            simulator.reset()
+                # Bind the shared lifecycle infrastructure to either the default
+                # simulator or a simulator supplied by the caller.
+                simulator.audit_log = self.audit_log
+                simulator.backtest_id = backtest_id
+                simulator.reset()
 
-            portfolio = PortfolioEngine(runner_config.initial_capital)
+                portfolio = PortfolioEngine(runner_config.initial_capital)
 
-            trades: list[Trade] = []
-            snapshots: list[PortfolioSnapshot] = []
+                trades: list[Trade] = []
+                snapshots: list[PortfolioSnapshot] = []
 
-            replay = SimulationEngine(
-                historical_bars,
-                audit_log=self.audit_log,
-                backtest_id=backtest_id,
-            )
-
-            def handle_market_event(event: MarketEvent) -> None:
-                generated_orders = strategy(event)
-
-                if generated_orders is not None:
-                    for order in generated_orders:
-                        if not isinstance(order, SimulatedOrder):
-                            raise TypeError(
-                                "strategy must return SimulatedOrder instances"
-                            )
-
-                        if order.symbol.upper() != event.bar.symbol.upper():
-                            raise ValueError(
-                                "order symbol must match the active historical bar"
-                            )
-
-                        execution_report = simulator.execute(
-                            order,
-                            market_price=event.bar.close,
-                            executed_at=event.timestamp,
-                        )
-
-                        trade = execution_report.to_trade()
-                        portfolio.apply_trade(trade)
-                        trades.append(trade)
-
-                # Value the active symbol at the bar close after all executions.
-                # This ensures the snapshot reflects the complete end-of-bar
-                # portfolio state.
-                portfolio.mark_to_market(
-                    event.bar.symbol,
-                    event.bar.close,
+                replay = SimulationEngine(
+                    historical_bars,
+                    audit_log=self.audit_log,
+                    backtest_id=backtest_id,
                 )
 
-                snapshots.append(
-                    portfolio.create_snapshot(event.timestamp)
+                def handle_market_event(event: MarketEvent) -> None:
+                    generated_orders = strategy(event)
+
+                    if generated_orders is not None:
+                        for order in generated_orders:
+                            if not isinstance(order, SimulatedOrder):
+                                raise TypeError(
+                                    "strategy must return SimulatedOrder instances"
+                                )
+
+                            if order.symbol.upper() != event.bar.symbol.upper():
+                                raise ValueError(
+                                    "order symbol must match the active historical bar"
+                                )
+
+                            execution_report = simulator.execute(
+                                order,
+                                market_price=event.bar.close,
+                                executed_at=event.timestamp,
+                            )
+
+                            trade = execution_report.to_trade()
+                            portfolio.apply_trade(trade)
+                            trades.append(trade)
+
+                    # Value the active symbol at the bar close after all executions.
+                    # This ensures the snapshot reflects the complete end-of-bar
+                    # portfolio state.
+                    portfolio.mark_to_market(
+                        event.bar.symbol,
+                        event.bar.close,
+                    )
+
+                    snapshots.append(
+                        portfolio.create_snapshot(event.timestamp)
+                    )
+
+                replay.subscribe(handle_market_event)
+                replay.run()
+
+                initial_capital = runner_config.initial_capital
+                final_equity = portfolio.equity
+                net_profit = final_equity - initial_capital
+
+                total_return = (
+                    net_profit / initial_capital
+                    if initial_capital != Decimal("0")
+                    else Decimal("0")
                 )
 
-            replay.subscribe(handle_market_event)
-            replay.run()
-
-            initial_capital = runner_config.initial_capital
-            final_equity = portfolio.equity
-            net_profit = final_equity - initial_capital
-
-            total_return = (
-                net_profit / initial_capital
-                if initial_capital != Decimal("0")
-                else Decimal("0")
-            )
-
-            return BacktestResult(
-                backtest_id=backtest_id,
-                status=BacktestStatus.COMPLETED,
-                config=runner_config,
-                started_at=started_at,
-                completed_at=datetime.now(timezone.utc),
-                trades=tuple(trades),
-                snapshots=tuple(snapshots),
-                metrics={
-                    "bars_processed": replay.total_bars,
-                    "orders_executed": len(trades),
-                    "snapshot_count": len(snapshots),
-                    "initial_capital": initial_capital,
-                    "final_equity": final_equity,
-                    "net_profit": net_profit,
-                    "total_return": total_return,
-                    "cash": portfolio.cash,
-                    "positions_value": portfolio.positions_value,
-                    "realized_pnl": portfolio.realized_pnl,
-                    "unrealized_pnl": portfolio.unrealized_pnl,
-                    "open_positions": len(portfolio.positions),
-                    "maximum_drawdown": portfolio.maximum_drawdown,
-                },
-            )
+                return BacktestResult(
+                    backtest_id=backtest_id,
+                    status=BacktestStatus.COMPLETED,
+                    config=runner_config,
+                    started_at=started_at,
+                    completed_at=datetime.now(timezone.utc),
+                    trades=tuple(trades),
+                    snapshots=tuple(snapshots),
+                    metrics={
+                        "bars_processed": replay.total_bars,
+                        "orders_executed": len(trades),
+                        "snapshot_count": len(snapshots),
+                        "initial_capital": initial_capital,
+                        "final_equity": final_equity,
+                        "net_profit": net_profit,
+                        "total_return": total_return,
+                        "cash": portfolio.cash,
+                        "positions_value": portfolio.positions_value,
+                        "realized_pnl": portfolio.realized_pnl,
+                        "unrealized_pnl": portfolio.unrealized_pnl,
+                        "open_positions": len(portfolio.positions),
+                        "maximum_drawdown": portfolio.maximum_drawdown,
+                     },
+                )
 
         return self.run(config, runner=simulation_runner)

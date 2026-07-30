@@ -9,6 +9,76 @@ class PerformanceAnalyzer:
     """Calculates risk-adjusted portfolio performance."""
 
     @staticmethod
+    def _calculate_realized_pnl_changes(
+        snapshots,
+    ) -> list[Decimal]:
+        ordered = sorted(
+            snapshots,
+            key=lambda snapshot: snapshot.timestamp,
+        )
+
+        return [
+            current.realized_pnl - previous.realized_pnl
+            for previous, current in zip(ordered, ordered[1:])
+        ]
+
+    @staticmethod
+    def _calculate_profit_factor(
+        pnl_changes: list[Decimal],
+    ) -> Decimal:
+        gross_profit = sum(
+            (
+                pnl
+                for pnl in pnl_changes
+                if pnl > 0
+            ),
+            Decimal("0"),
+        )
+
+        gross_loss = abs(
+            sum(
+                (
+                    pnl
+                    for pnl in pnl_changes
+                    if pnl < 0
+                ),
+                Decimal("0"),
+            )
+        )
+
+        if gross_loss == 0:
+            return Decimal("0")
+
+        return gross_profit / gross_loss
+
+    @staticmethod
+    def _calculate_win_rate(
+        pnl_changes: list[Decimal],
+    ) -> Decimal:
+        winning_periods = sum(
+            1
+            for pnl in pnl_changes
+            if pnl > 0
+        )
+
+        losing_periods = sum(
+            1
+            for pnl in pnl_changes
+            if pnl < 0
+        )
+
+        closed_periods = winning_periods + losing_periods
+
+        if closed_periods == 0:
+            return Decimal("0")
+
+        return (
+            Decimal(winning_periods)
+            / Decimal(closed_periods)
+            * Decimal("100")
+        )
+
+    @staticmethod
     def _calculate_calmar_ratio(
         cagr: Decimal,
         maximum_drawdown: Decimal,
@@ -19,7 +89,9 @@ class PerformanceAnalyzer:
         return cagr / abs(maximum_drawdown)
 
     @staticmethod
-    def _calculate_returns(snapshots) -> list[Decimal]:
+    def _calculate_returns(
+        snapshots,
+    ) -> list[Decimal]:
         ordered = sorted(
             snapshots,
             key=lambda snapshot: snapshot.timestamp,
@@ -108,11 +180,25 @@ class PerformanceAnalyzer:
             risk_metrics.max_drawdown,
         )
 
+        pnl_changes = self._calculate_realized_pnl_changes(
+            result.snapshots
+        )
+
+        profit_factor = self._calculate_profit_factor(
+            pnl_changes
+        )
+
+        win_rate = self._calculate_win_rate(
+            pnl_changes
+        )
+
         if len(returns) < 2:
             return PerformanceMetrics(
                 sharpe_ratio=Decimal("0"),
                 sortino_ratio=Decimal("0"),
                 calmar_ratio=calmar_ratio,
+                profit_factor=profit_factor,
+                win_rate=win_rate,
             )
 
         mean_return = (
@@ -120,7 +206,9 @@ class PerformanceAnalyzer:
             / Decimal(len(returns))
         )
 
-        volatility = self._calculate_sample_volatility(returns)
+        volatility = self._calculate_sample_volatility(
+            returns
+        )
 
         if volatility == 0:
             sharpe_ratio = Decimal("0")
@@ -140,4 +228,6 @@ class PerformanceAnalyzer:
             sharpe_ratio=sharpe_ratio,
             sortino_ratio=sortino_ratio,
             calmar_ratio=calmar_ratio,
+            profit_factor=profit_factor,
+            win_rate=win_rate,
         )

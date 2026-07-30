@@ -1,4 +1,4 @@
-from ai_trading_platform_v4_pro.ai_trading_platform_v4_pro.app.ai.confidence_engine import (
+from app.ai.confidence_engine import (
     ConfidenceDecision,
     ConfidenceInput,
     EnterpriseConfidenceEngine,
