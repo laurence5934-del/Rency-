@@ -3,7 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Sequence
+from .performance_models import PerformanceMetrics
+from .risk_models import RiskMetrics
 
+
+@dataclass(frozen=True, slots=True)
+class AnalyticsReport:
+    """Combined enterprise analytics report."""
+
+    returns: ReturnMetrics
+    performance: PerformanceMetrics
+    risk: RiskMetrics
 
 @dataclass(frozen=True, slots=True)
 class ReturnMetrics:
