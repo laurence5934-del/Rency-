@@ -12,15 +12,19 @@ from app.strategy.analytics.performance_models import (
     PerformanceMetrics,
 )
 from app.strategy.analytics.risk_models import RiskMetrics
-
+from app.strategy.analytics.expectancy_models import (
+    ExpectancyMetrics,
+)
+from app.strategy.analytics.strategy_quality_models import (
+    StrategyQualityMetrics,
+)
 
 @dataclass
 class StubAnalyzer:
     result: object
 
-    def analyze(self, backtest_result):
+    def analyze(self, backtest_result, **kwargs):
         return self.result
-
 
 def test_analyze_combines_all_analytics_results():
     backtest_result = object()
@@ -48,10 +52,34 @@ def test_analyze_combines_all_analytics_results():
         volatility=Decimal("0.12"),
     )
 
+    expectancy_metrics = ExpectancyMetrics(
+        average_win=Decimal("200"),
+        average_loss=Decimal("100"),
+        payoff_ratio=Decimal("2"),
+        expectancy=Decimal("80"),
+        expectancy_percent=Decimal("0.8"),
+        recovery_factor=Decimal("4"),
+    )
+
+    strategy_quality_metrics = StrategyQualityMetrics(
+        system_quality_number=Decimal("2.1"),
+        kelly_criterion=Decimal("0.25"),
+        gain_to_pain_ratio=Decimal("3"),
+        ulcer_index=Decimal("0.05"),
+    )
+
     engine = PerformanceAnalyticsEngine(
         return_analyzer=StubAnalyzer(return_metrics),
-        performance_analyzer=StubAnalyzer(performance_metrics),
+        performance_analyzer=StubAnalyzer(
+            performance_metrics
+        ),
         risk_analyzer=StubAnalyzer(risk_metrics),
+        expectancy_analyzer=StubAnalyzer(
+            expectancy_metrics
+        ),
+        strategy_quality_analyzer=StubAnalyzer(
+            strategy_quality_metrics
+        ),
     )
 
     report = engine.analyze(backtest_result)
@@ -60,4 +88,22 @@ def test_analyze_combines_all_analytics_results():
         returns=return_metrics,
         performance=performance_metrics,
         risk=risk_metrics,
+        expectancy=expectancy_metrics,
+        strategy_quality=strategy_quality_metrics,
+    )
+    
+    expectancy_metrics = ExpectancyMetrics(
+        average_win=Decimal("200"),
+        average_loss=Decimal("100"),
+        payoff_ratio=Decimal("2"),
+        expectancy=Decimal("80"),
+        expectancy_percent=Decimal("0.8"),
+        recovery_factor=Decimal("4"),
+    )
+
+    strategy_quality_metrics = StrategyQualityMetrics(
+        system_quality_number=Decimal("2.1"),
+        kelly_criterion=Decimal("0.25"),
+        gain_to_pain_ratio=Decimal("3"),
+        ulcer_index=Decimal("0.05"),
     )

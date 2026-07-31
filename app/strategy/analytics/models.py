@@ -5,7 +5,8 @@ from decimal import Decimal
 from typing import Sequence
 from .performance_models import PerformanceMetrics
 from .risk_models import RiskMetrics
-
+from .expectancy_models import ExpectancyMetrics
+from .strategy_quality_models import StrategyQualityMetrics
 
 @dataclass(frozen=True, slots=True)
 class AnalyticsReport:
@@ -14,7 +15,9 @@ class AnalyticsReport:
     returns: ReturnMetrics
     performance: PerformanceMetrics
     risk: RiskMetrics
-
+    expectancy: ExpectancyMetrics
+    strategy_quality: StrategyQualityMetrics
+    
 @dataclass(frozen=True, slots=True)
 class ReturnMetrics:
     """Immutable return analytics produced from a backtest result."""
