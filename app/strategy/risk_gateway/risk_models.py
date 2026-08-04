@@ -1,0 +1,1055 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from decimal import Decimal
+from enum import Enum
+
+from app.strategy.order_manager import (
+    OrderRequest,
+    OrderSide,
+)
+
+
+_ZERO = Decimal("0")
+
+
+class RiskRuleType(str, Enum):
+    """Supported enterprise pre-trade risk rules."""
+
+    MAX_ORDER_QUANTITY = "MAX_ORDER_QUANTITY"
+    MAX_ORDER_NOTIONAL = "MAX_ORDER_NOTIONAL"
+    MAX_POSITION_QUANTITY = "MAX_POSITION_QUANTITY"
+    MAX_POSITION_NOTIONAL = "MAX_POSITION_NOTIONAL"
+    MAX_GROSS_EXPOSURE = "MAX_GROSS_EXPOSURE"
+    MAX_NET_EXPOSURE = "MAX_NET_EXPOSURE"
+    BUYING_POWER = "BUYING_POWER"
+    MARGIN = "MARGIN"
+    DAILY_LOSS = "DAILY_LOSS"
+    SHORT_SELLING = "SHORT_SELLING"
+    CONCENTRATION = "CONCENTRATION"
+    TRADING_SESSION = "TRADING_SESSION"
+    KILL_SWITCH = "KILL_SWITCH"
+
+
+class RiskSeverity(str, Enum):
+    """Severity assigned to a risk violation."""
+
+    INFO = "INFO"
+    WARNING = "WARNING"
+    CRITICAL = "CRITICAL"
+
+
+class RiskDecision(str, Enum):
+    """Final pre-trade risk decision."""
+
+    APPROVE = "APPROVE"
+    REDUCE = "REDUCE"
+    HOLD = "HOLD"
+    REJECT = "REJECT"
+
+
+class RiskEvaluationStatus(str, Enum):
+    """Lifecycle status of a risk evaluation."""
+
+    PENDING = "PENDING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+_TERMINAL_DECISIONS = {
+    RiskDecision.APPROVE,
+    RiskDecision.REDUCE,
+    RiskDecision.HOLD,
+    RiskDecision.REJECT,
+}
+
+
+class RiskModelSupport:
+    """Shared validation helpers for risk gateway models."""
+
+    @staticmethod
+    def required_text(
+        value: str,
+        field_name: str,
+    ) -> str:
+        if not isinstance(value, str):
+            raise TypeError(
+                f"{field_name} must be a string"
+            )
+
+        normalized = value.strip()
+
+        if not normalized:
+            raise ValueError(
+                f"{field_name} must not be empty"
+            )
+
+        return normalized
+
+    @staticmethod
+    def optional_text(
+        value: str | None,
+        field_name: str,
+    ) -> str | None:
+        if value is None:
+            return None
+
+        if not isinstance(value, str):
+            raise TypeError(
+                f"{field_name} must be a string or None"
+            )
+
+        normalized = value.strip()
+
+        if not normalized:
+            raise ValueError(
+                f"{field_name} must not be empty"
+            )
+
+        return normalized
+
+    @staticmethod
+    def require_decimal(
+        value: Decimal,
+        field_name: str,
+    ) -> None:
+        if not isinstance(value, Decimal):
+            raise TypeError(
+                f"{field_name} must be a Decimal"
+            )
+
+    @staticmethod
+    def validate_datetime(
+        value: datetime,
+        field_name: str,
+    ) -> None:
+        if not isinstance(value, datetime):
+            raise TypeError(
+                f"{field_name} must be a datetime"
+            )
+
+        if value.tzinfo is None:
+            raise ValueError(
+                f"{field_name} must be timezone-aware"
+            )
+
+    @staticmethod
+    def normalize_pairs(
+        values: tuple[tuple[str, str], ...]
+        | list[tuple[str, str]],
+        collection_name: str,
+    ) -> tuple[tuple[str, str], ...]:
+        normalized: list[tuple[str, str]] = []
+        seen_keys: set[str] = set()
+
+        for item in values:
+            if (
+                not isinstance(item, tuple)
+                or len(item) != 2
+            ):
+                raise TypeError(
+                    f"each {collection_name} item must be "
+                    "a two-item tuple"
+                )
+
+            raw_key, raw_value = item
+
+            key = str(raw_key).strip()
+            value = str(raw_value).strip()
+
+            if not key:
+                raise ValueError(
+                    f"{collection_name} keys must not be empty"
+                )
+
+            if key in seen_keys:
+                raise ValueError(
+                    f"{collection_name} keys must be unique"
+                )
+
+            seen_keys.add(key)
+            normalized.append((key, value))
+
+        return tuple(normalized)
+
+    @staticmethod
+    def normalize_warnings(
+        warnings: tuple[str, ...] | list[str],
+    ) -> tuple[str, ...]:
+        normalized: list[str] = []
+
+        for warning in warnings:
+            if not isinstance(warning, str):
+                raise TypeError(
+                    "every warning must be a string"
+                )
+
+            value = warning.strip()
+
+            if not value:
+                raise ValueError(
+                    "warnings must not contain empty values"
+                )
+
+            normalized.append(value)
+
+        return tuple(normalized)
+
+
+@dataclass(frozen=True, slots=True)
+class RiskViolation:
+    """Immutable violation generated by one risk rule."""
+
+    violation_id: str
+    evaluation_id: str
+    rule_type: RiskRuleType
+    severity: RiskSeverity
+    message: str
+    observed_value: Decimal
+    limit_value: Decimal
+    occurred_at: datetime
+    symbol: str | None = None
+    rule_id: str | None = None
+    metadata: tuple[tuple[str, str], ...] = field(
+        default_factory=tuple
+    )
+
+    def __post_init__(self) -> None:
+        normalized_violation_id = (
+            RiskModelSupport.required_text(
+                self.violation_id,
+                "violation_id",
+            )
+        )
+        normalized_evaluation_id = (
+            RiskModelSupport.required_text(
+                self.evaluation_id,
+                "evaluation_id",
+            )
+        )
+        normalized_message = (
+            RiskModelSupport.required_text(
+                self.message,
+                "message",
+            )
+        )
+
+        if not isinstance(
+            self.rule_type,
+            RiskRuleType,
+        ):
+            raise TypeError(
+                "rule_type must be a RiskRuleType"
+            )
+
+        if not isinstance(
+            self.severity,
+            RiskSeverity,
+        ):
+            raise TypeError(
+                "severity must be a RiskSeverity"
+            )
+
+        RiskModelSupport.require_decimal(
+            self.observed_value,
+            "observed_value",
+        )
+        RiskModelSupport.require_decimal(
+            self.limit_value,
+            "limit_value",
+        )
+
+        if self.observed_value < _ZERO:
+            raise ValueError(
+                "observed_value must not be negative"
+            )
+
+        if self.limit_value < _ZERO:
+            raise ValueError(
+                "limit_value must not be negative"
+            )
+
+        RiskModelSupport.validate_datetime(
+            self.occurred_at,
+            "occurred_at",
+        )
+
+        normalized_symbol = (
+            RiskModelSupport.optional_text(
+                self.symbol,
+                "symbol",
+            )
+        )
+
+        if normalized_symbol is not None:
+            normalized_symbol = normalized_symbol.upper()
+
+        normalized_rule_id = (
+            RiskModelSupport.optional_text(
+                self.rule_id,
+                "rule_id",
+            )
+        )
+
+        normalized_metadata = (
+            RiskModelSupport.normalize_pairs(
+                self.metadata,
+                "metadata",
+            )
+        )
+
+        object.__setattr__(
+            self,
+            "violation_id",
+            normalized_violation_id,
+        )
+        object.__setattr__(
+            self,
+            "evaluation_id",
+            normalized_evaluation_id,
+        )
+        object.__setattr__(
+            self,
+            "message",
+            normalized_message,
+        )
+        object.__setattr__(
+            self,
+            "symbol",
+            normalized_symbol,
+        )
+        object.__setattr__(
+            self,
+            "rule_id",
+            normalized_rule_id,
+        )
+        object.__setattr__(
+            self,
+            "metadata",
+            normalized_metadata,
+        )
+
+    @property
+    def excess_value(self) -> Decimal:
+        return max(
+            _ZERO,
+            self.observed_value - self.limit_value,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RiskEvaluationRequest:
+    """Immutable pre-trade risk evaluation request."""
+
+    evaluation_id: str
+    request: OrderRequest
+    account_id: str
+    portfolio_id: str
+    requested_at: datetime
+    market_price: Decimal
+    current_position_quantity: Decimal
+    current_position_notional: Decimal
+    available_buying_power: Decimal
+    available_margin: Decimal
+    gross_exposure: Decimal
+    net_exposure: Decimal
+    daily_realized_pnl: Decimal
+    daily_unrealized_pnl: Decimal
+    trading_session_allowed: bool
+    short_selling_allowed: bool
+    kill_switch_active: bool = False
+    metadata: tuple[tuple[str, str], ...] = field(
+        default_factory=tuple
+    )
+
+    def __post_init__(self) -> None:
+        normalized_evaluation_id = (
+            RiskModelSupport.required_text(
+                self.evaluation_id,
+                "evaluation_id",
+            )
+        )
+
+        if not isinstance(self.request, OrderRequest):
+            raise TypeError(
+                "request must be an OrderRequest"
+            )
+
+        normalized_account_id = (
+            RiskModelSupport.required_text(
+                self.account_id,
+                "account_id",
+            )
+        )
+        normalized_portfolio_id = (
+            RiskModelSupport.required_text(
+                self.portfolio_id,
+                "portfolio_id",
+            )
+        )
+
+        if (
+            normalized_portfolio_id
+            != self.request.portfolio_id
+        ):
+            raise ValueError(
+                "portfolio_id must match request portfolio_id"
+            )
+
+        RiskModelSupport.validate_datetime(
+            self.requested_at,
+            "requested_at",
+        )
+
+        if self.requested_at < self.request.created_at:
+            raise ValueError(
+                "requested_at must not be earlier than "
+                "request created_at"
+            )
+
+        decimal_fields = (
+            "market_price",
+            "current_position_quantity",
+            "current_position_notional",
+            "available_buying_power",
+            "available_margin",
+            "gross_exposure",
+            "net_exposure",
+            "daily_realized_pnl",
+            "daily_unrealized_pnl",
+        )
+
+        for field_name in decimal_fields:
+            RiskModelSupport.require_decimal(
+                getattr(self, field_name),
+                field_name,
+            )
+
+        if self.market_price <= _ZERO:
+            raise ValueError(
+                "market_price must be greater than zero"
+            )
+
+        for field_name in (
+            "current_position_quantity",
+            "current_position_notional",
+            "available_buying_power",
+            "available_margin",
+            "gross_exposure",
+        ):
+            if getattr(self, field_name) < _ZERO:
+                raise ValueError(
+                    f"{field_name} must not be negative"
+                )
+
+        for field_name in (
+            "trading_session_allowed",
+            "short_selling_allowed",
+            "kill_switch_active",
+        ):
+            if not isinstance(
+                getattr(self, field_name),
+                bool,
+            ):
+                raise TypeError(
+                    f"{field_name} must be a bool"
+                )
+
+        if (
+            self.request.side is OrderSide.SELL_SHORT
+            and not self.short_selling_allowed
+        ):
+            pass
+
+        normalized_metadata = (
+            RiskModelSupport.normalize_pairs(
+                self.metadata,
+                "metadata",
+            )
+        )
+
+        object.__setattr__(
+            self,
+            "evaluation_id",
+            normalized_evaluation_id,
+        )
+        object.__setattr__(
+            self,
+            "account_id",
+            normalized_account_id,
+        )
+        object.__setattr__(
+            self,
+            "portfolio_id",
+            normalized_portfolio_id,
+        )
+        object.__setattr__(
+            self,
+            "metadata",
+            normalized_metadata,
+        )
+
+    @property
+    def order_notional(self) -> Decimal:
+        return (
+            self.request.quantity
+            * self.market_price
+        )
+
+    @property
+    def projected_position_quantity(
+        self,
+    ) -> Decimal:
+        if self.request.side in {
+            OrderSide.BUY,
+            OrderSide.BUY_TO_COVER,
+        }:
+            return (
+                self.current_position_quantity
+                + self.request.quantity
+            )
+
+        return max(
+            _ZERO,
+            self.current_position_quantity
+            - self.request.quantity,
+        )
+
+    @property
+    def projected_daily_pnl(self) -> Decimal:
+        return (
+            self.daily_realized_pnl
+            + self.daily_unrealized_pnl
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RiskEvaluationResult:
+    """Immutable aggregate outcome of a risk evaluation."""
+
+    evaluation_id: str
+    status: RiskEvaluationStatus
+    decision: RiskDecision
+    evaluated_at: datetime
+    order_id: str
+    portfolio_id: str
+    requested_quantity: Decimal
+    approved_quantity: Decimal
+    requested_notional: Decimal
+    approved_notional: Decimal
+    violations: tuple[RiskViolation, ...] = field(
+        default_factory=tuple
+    )
+    recommendation: str = (
+        "Review the pre-trade risk result."
+    )
+    warnings: tuple[str, ...] = field(
+        default_factory=tuple
+    )
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        normalized_evaluation_id = (
+            RiskModelSupport.required_text(
+                self.evaluation_id,
+                "evaluation_id",
+            )
+        )
+        normalized_order_id = (
+            RiskModelSupport.required_text(
+                self.order_id,
+                "order_id",
+            )
+        )
+        normalized_portfolio_id = (
+            RiskModelSupport.required_text(
+                self.portfolio_id,
+                "portfolio_id",
+            )
+        )
+        normalized_recommendation = (
+            RiskModelSupport.required_text(
+                self.recommendation,
+                "recommendation",
+            )
+        )
+
+        if not isinstance(
+            self.status,
+            RiskEvaluationStatus,
+        ):
+            raise TypeError(
+                "status must be a RiskEvaluationStatus"
+            )
+
+        if not isinstance(
+            self.decision,
+            RiskDecision,
+        ):
+            raise TypeError(
+                "decision must be a RiskDecision"
+            )
+
+        RiskModelSupport.validate_datetime(
+            self.evaluated_at,
+            "evaluated_at",
+        )
+
+        for field_name in (
+            "requested_quantity",
+            "approved_quantity",
+            "requested_notional",
+            "approved_notional",
+        ):
+            RiskModelSupport.require_decimal(
+                getattr(self, field_name),
+                field_name,
+            )
+
+            if getattr(self, field_name) < _ZERO:
+                raise ValueError(
+                    f"{field_name} must not be negative"
+                )
+
+        if (
+            self.approved_quantity
+            > self.requested_quantity
+        ):
+            raise ValueError(
+                "approved_quantity must not exceed "
+                "requested_quantity"
+            )
+
+        if (
+            self.approved_notional
+            > self.requested_notional
+        ):
+            raise ValueError(
+                "approved_notional must not exceed "
+                "requested_notional"
+            )
+
+        normalized_violations = tuple(
+            self.violations
+        )
+
+        for violation in normalized_violations:
+            if not isinstance(
+                violation,
+                RiskViolation,
+            ):
+                raise TypeError(
+                    "every violation must be a "
+                    "RiskViolation"
+                )
+
+            if (
+                violation.evaluation_id
+                != normalized_evaluation_id
+            ):
+                raise ValueError(
+                    "violation evaluation_id must "
+                    "match result evaluation_id"
+                )
+
+            if (
+                violation.occurred_at
+                > self.evaluated_at
+            ):
+                raise ValueError(
+                    "violation occurred_at must not be later "
+                    "than evaluated_at"
+                )
+
+        violation_ids = [
+            violation.violation_id
+            for violation in normalized_violations
+        ]
+
+        if len(set(violation_ids)) != len(
+            violation_ids
+        ):
+            raise ValueError(
+                "violation_id values must be unique"
+            )
+
+        normalized_error = (
+            RiskModelSupport.optional_text(
+                self.error,
+                "error",
+            )
+        )
+
+        if self.status is RiskEvaluationStatus.FAILED:
+            if normalized_error is None:
+                raise ValueError(
+                    "failed evaluations must include an error"
+                )
+        elif normalized_error is not None:
+            raise ValueError(
+                "only failed evaluations may include an error"
+            )
+
+        if self.decision is RiskDecision.APPROVE:
+            if normalized_violations:
+                raise ValueError(
+                    "approved evaluations must not include "
+                    "violations"
+                )
+
+            if (
+                self.approved_quantity
+                != self.requested_quantity
+            ):
+                raise ValueError(
+                    "approved evaluations require the full "
+                    "requested quantity"
+                )
+
+            if (
+                self.approved_notional
+                != self.requested_notional
+            ):
+                raise ValueError(
+                    "approved evaluations require the full "
+                    "requested notional"
+                )
+
+        if self.decision is RiskDecision.REDUCE:
+            if not normalized_violations:
+                raise ValueError(
+                    "reduced evaluations must include "
+                    "violations"
+                )
+
+            if not (
+                _ZERO
+                < self.approved_quantity
+                < self.requested_quantity
+            ):
+                raise ValueError(
+                    "reduced evaluations require a partial "
+                    "approved quantity"
+                )
+
+        if self.decision in {
+            RiskDecision.HOLD,
+            RiskDecision.REJECT,
+        }:
+            if self.approved_quantity != _ZERO:
+                raise ValueError(
+                    "held and rejected evaluations must have "
+                    "zero approved quantity"
+                )
+
+            if self.approved_notional != _ZERO:
+                raise ValueError(
+                    "held and rejected evaluations must have "
+                    "zero approved notional"
+                )
+
+        normalized_warnings = (
+            RiskModelSupport.normalize_warnings(
+                self.warnings
+            )
+        )
+
+        object.__setattr__(
+            self,
+            "evaluation_id",
+            normalized_evaluation_id,
+        )
+        object.__setattr__(
+            self,
+            "order_id",
+            normalized_order_id,
+        )
+        object.__setattr__(
+            self,
+            "portfolio_id",
+            normalized_portfolio_id,
+        )
+        object.__setattr__(
+            self,
+            "violations",
+            normalized_violations,
+        )
+        object.__setattr__(
+            self,
+            "recommendation",
+            normalized_recommendation,
+        )
+        object.__setattr__(
+            self,
+            "warnings",
+            normalized_warnings,
+        )
+        object.__setattr__(
+            self,
+            "error",
+            normalized_error,
+        )
+
+    @property
+    def is_terminal(self) -> bool:
+        return (
+            self.status
+            in {
+                RiskEvaluationStatus.COMPLETED,
+                RiskEvaluationStatus.FAILED,
+            }
+            and self.decision in _TERMINAL_DECISIONS
+        )
+
+    @property
+    def has_critical_violation(self) -> bool:
+        return any(
+            violation.severity
+            is RiskSeverity.CRITICAL
+            for violation in self.violations
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RiskGatewayReport:
+    """Immutable audit report returned by the risk gateway."""
+
+    report_id: str
+    request: RiskEvaluationRequest
+    result: RiskEvaluationResult
+    reported_at: datetime
+    message: str
+    metadata: tuple[tuple[str, str], ...] = field(
+        default_factory=tuple
+    )
+    warnings: tuple[str, ...] = field(
+        default_factory=tuple
+    )
+
+    def __post_init__(self) -> None:
+        normalized_report_id = (
+            RiskModelSupport.required_text(
+                self.report_id,
+                "report_id",
+            )
+        )
+
+        if not isinstance(
+            self.request,
+            RiskEvaluationRequest,
+        ):
+            raise TypeError(
+                "request must be a RiskEvaluationRequest"
+            )
+
+        if not isinstance(
+            self.result,
+            RiskEvaluationResult,
+        ):
+            raise TypeError(
+                "result must be a RiskEvaluationResult"
+            )
+
+        normalized_message = (
+            RiskModelSupport.required_text(
+                self.message,
+                "message",
+            )
+        )
+
+        RiskModelSupport.validate_datetime(
+            self.reported_at,
+            "reported_at",
+        )
+
+        if (
+            self.request.evaluation_id
+            != self.result.evaluation_id
+        ):
+            raise ValueError(
+                "request and result evaluation_id values "
+                "must match"
+            )
+
+        if (
+            self.request.request.order_id
+            != self.result.order_id
+        ):
+            raise ValueError(
+                "result order_id must match request order_id"
+            )
+
+        if (
+            self.request.portfolio_id
+            != self.result.portfolio_id
+        ):
+            raise ValueError(
+                "result portfolio_id must match request"
+            )
+
+        if (
+            self.result.evaluated_at
+            < self.request.requested_at
+        ):
+            raise ValueError(
+                "result evaluated_at must not be earlier "
+                "than request requested_at"
+            )
+
+        if self.reported_at < self.result.evaluated_at:
+            raise ValueError(
+                "reported_at must not be earlier than "
+                "result evaluated_at"
+            )
+
+        normalized_metadata = (
+            RiskModelSupport.normalize_pairs(
+                self.metadata,
+                "metadata",
+            )
+        )
+        normalized_warnings = (
+            RiskModelSupport.normalize_warnings(
+                self.warnings
+            )
+        )
+
+        object.__setattr__(
+            self,
+            "report_id",
+            normalized_report_id,
+        )
+        object.__setattr__(
+            self,
+            "message",
+            normalized_message,
+        )
+        object.__setattr__(
+            self,
+            "metadata",
+            normalized_metadata,
+        )
+        object.__setattr__(
+            self,
+            "warnings",
+            normalized_warnings,
+        )
+@dataclass(frozen=True, slots=True)
+class RiskPolicy:
+    """Immutable configuration for pre-trade risk evaluation."""
+
+    policy_id: str
+    name: str
+    max_order_quantity: Decimal
+    max_order_notional: Decimal
+    max_position_quantity: Decimal
+    max_position_notional: Decimal
+    max_gross_exposure: Decimal
+    max_net_exposure: Decimal
+    minimum_buying_power: Decimal
+    minimum_available_margin: Decimal
+    daily_loss_limit: Decimal
+    allow_short_selling: bool
+    allow_trading_outside_session: bool = False
+    reduction_allowed: bool = True
+    enabled: bool = True
+    metadata: tuple[tuple[str, str], ...] = field(
+        default_factory=tuple
+    )
+
+    def __post_init__(self) -> None:
+        normalized_policy_id = (
+            RiskModelSupport.required_text(
+                self.policy_id,
+                "policy_id",
+            )
+        )
+        normalized_name = (
+            RiskModelSupport.required_text(
+                self.name,
+                "name",
+            )
+        )
+
+        decimal_fields = (
+            "max_order_quantity",
+            "max_order_notional",
+            "max_position_quantity",
+            "max_position_notional",
+            "max_gross_exposure",
+            "max_net_exposure",
+            "minimum_buying_power",
+            "minimum_available_margin",
+            "daily_loss_limit",
+        )
+
+        for field_name in decimal_fields:
+            value = getattr(self, field_name)
+
+            RiskModelSupport.require_decimal(
+                value,
+                field_name,
+            )
+
+            if value < _ZERO:
+                raise ValueError(
+                    f"{field_name} must not be negative"
+                )
+
+        if self.max_order_quantity == _ZERO:
+            raise ValueError(
+                "max_order_quantity must be greater than zero"
+            )
+
+        if self.max_order_notional == _ZERO:
+            raise ValueError(
+                "max_order_notional must be greater than zero"
+            )
+
+        if self.max_position_quantity == _ZERO:
+            raise ValueError(
+                "max_position_quantity must be greater than zero"
+            )
+
+        if self.max_position_notional == _ZERO:
+            raise ValueError(
+                "max_position_notional must be greater than zero"
+            )
+
+        for field_name in (
+            "allow_short_selling",
+            "allow_trading_outside_session",
+            "reduction_allowed",
+            "enabled",
+        ):
+            if not isinstance(
+                getattr(self, field_name),
+                bool,
+            ):
+                raise TypeError(
+                    f"{field_name} must be a bool"
+                )
+
+        normalized_metadata = (
+            RiskModelSupport.normalize_pairs(
+                self.metadata,
+                "metadata",
+            )
+        )
+
+        object.__setattr__(
+            self,
+            "policy_id",
+            normalized_policy_id,
+        )
+        object.__setattr__(
+            self,
+            "name",
+            normalized_name,
+        )
+        object.__setattr__(
+            self,
+            "metadata",
+            normalized_metadata,
+        )
